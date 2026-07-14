@@ -6,7 +6,7 @@ set -eu
 # All feature lists and version info read from Cargo.toml — nothing hardcoded.
 # POSIX sh — no bash required. Works on Alpine, Debian, macOS, everywhere.
 
-REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
+REPO_URL="https://github.com/Enjection/zeroclaw.git"
 
 # ── Output helpers (terminal-aware) ──────────────────────────────
 
@@ -286,7 +286,7 @@ install_prebuilt() {
   fi
 
   # Resolve latest release version via GitHub API
-  version=$(curl -fsSL "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest" |
+  version=$(curl -fsSL "https://api.github.com/repos/Enjection/zeroclaw/releases/latest" |
     grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
 
   if [ -z "$version" ]; then
@@ -295,8 +295,8 @@ install_prebuilt() {
   fi
 
   asset_name="zeroclaw-${triple}.tar.gz"
-  asset_url="https://github.com/zeroclaw-labs/zeroclaw/releases/download/${version}/${asset_name}"
-  sha256_url="https://github.com/zeroclaw-labs/zeroclaw/releases/download/${version}/SHA256SUMS"
+  asset_url="https://github.com/Enjection/zeroclaw/releases/download/${version}/${asset_name}"
+  sha256_url="https://github.com/Enjection/zeroclaw/releases/download/${version}/SHA256SUMS"
 
   echo
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"

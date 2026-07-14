@@ -94,10 +94,13 @@ fn install_dir_not_writable_message(dir: &str, error: &str) -> String {
     }
 }
 
+// Enjection fork: self-update pulls from the fork's releases, never upstream,
+// so `zeroclaw update` can never replace this custom (Postgres-enabled) build
+// with an upstream lean binary.
 const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
+    "https://api.github.com/repos/Enjection/zeroclaw/releases/latest";
 const GITHUB_RELEASES_TAG_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/tags";
+    "https://api.github.com/repos/Enjection/zeroclaw/releases/tags";
 
 #[derive(Debug)]
 pub struct UpdateInfo {

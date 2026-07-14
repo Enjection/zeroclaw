@@ -289,6 +289,10 @@ default = [
     "gateway",
     "observability-prometheus",
     "schema-export",
+    # Enjection fork: Postgres-backed memory is on by default. Because the
+    # canonical `dist` set = default leaves + dist_extra_features, this also
+    # ships in the pre-built/release binary (see xtask generate features).
+    "memory-postgres",
 ]
 
 # The core agent runtime — agent loop, tools, persistence subsystems.
