@@ -4066,6 +4066,57 @@ Ensure only one `zeroclaw` process is using this bot token."
                                     "answerCallbackQuery failed"
                                 );
                             }
+
+                            // Update the approval message in place: drop the
+                            // inline keyboard and show the chosen status, so the
+                            // buttons don't linger after a decision is made.
+                            if matches!(action, "approve" | "deny" | "always")
+                                && let Some(message) = cb.get("message")
+                                && let Some(chat_id) = message
+                                    .get("chat")
+                                    .and_then(|c| c.get("id"))
+                                    .and_then(serde_json::Value::as_i64)
+                                && let Some(message_id) =
+                                    message.get("message_id").and_then(serde_json::Value::as_i64)
+                            {
+                                let original = message
+                                    .get("text")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default();
+                                let base = original
+                                    .strip_suffix("Tap a button below:")
+                                    .unwrap_or(original)
+                                    .trim_end();
+                                let edited_text = if base.is_empty() {
+                                    answer_text.to_string()
+                                } else {
+                                    format!("{base}\n\n{answer_text}")
+                                };
+                                let edit_body = serde_json::json!({
+                                    "chat_id": chat_id,
+                                    "message_id": message_id,
+                                    "text": edited_text,
+                                    "reply_markup": { "inline_keyboard": [] },
+                                });
+                                if let Err(e) = self
+                                    .http_client()
+                                    .post(self.api_url("editMessageText"))
+                                    .json(&edit_body)
+                                    .send()
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                                        "editMessageText (approval status) failed"
+                                    );
+                                }
+                            }
                         }
 
                         continue; // callback_query is not a regular message
