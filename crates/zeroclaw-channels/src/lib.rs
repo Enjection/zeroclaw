@@ -75,6 +75,8 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+#[cfg(feature = "channel-telegram")]
+pub mod telegram_topics;
 #[cfg(feature = "channel-twitch")]
 pub mod twitch;
 #[cfg(feature = "channel-twitter")]

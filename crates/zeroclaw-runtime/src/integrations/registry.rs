@@ -229,6 +229,7 @@ mod tests {
                 enabled: true,
                 bot_token: "123:ABC".into(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                topics: zeroclaw_config::schema::TopicsConfig::default(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,

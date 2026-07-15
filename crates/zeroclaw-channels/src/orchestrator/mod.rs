@@ -24787,6 +24787,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                topics: zeroclaw_config::schema::TopicsConfig::default(),
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
@@ -24815,6 +24816,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                topics: zeroclaw_config::schema::TopicsConfig::default(),
             },
         );
         config

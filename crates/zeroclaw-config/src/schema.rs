@@ -13129,6 +13129,31 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
 }
 
+/// Forum-topics configuration for a Telegram supergroup.
+///
+/// When `enabled`, non-General forum topics become room-scoped conversation
+/// sessions (one session per topic) and owner-gated `/new_topic`, `/topics`,
+/// `/rename_topic`, `/close_topic`, `/reopen_topic` commands manage them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.telegram.topics"]
+pub struct TopicsConfig {
+    /// Whether forum-topics support is active for this Telegram channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Numeric Telegram user-ids allowed to run topic-management commands.
+    /// Usernames are rejected — the owner gate reads `message.from.id`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub owners: Vec<String>,
+    /// Default `icon_color` (Telegram RGB int) applied to newly created topics
+    /// when the command does not specify one.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub default_icon_color: Option<i64>,
+}
+
 /// Telegram bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -13202,6 +13227,11 @@ pub struct TelegramConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+
+    /// Forum-topics support (per-topic sessions + owner-gated commands).
+    #[serde(default)]
+    #[nested]
+    pub topics: TopicsConfig,
 }
 
 impl Default for TelegramConfig {
@@ -13217,6 +13247,7 @@ impl Default for TelegramConfig {
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
+            topics: TopicsConfig::default(),
             excluded_tools: Vec::new(),
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
@@ -22698,6 +22729,28 @@ enabled = true
     }
 
     #[test]
+    async fn telegram_topics_config_serde_defaults() {
+        // Omitting the [topics] table yields a disabled, empty default.
+        let tg: TelegramConfig = toml::from_str("bot_token = \"tok\"").unwrap();
+        assert!(!tg.topics.enabled);
+        assert!(tg.topics.owners.is_empty());
+        assert_eq!(tg.topics.default_icon_color, None);
+
+        // A populated [topics] table round-trips.
+        let tg: TelegramConfig = toml::from_str(
+            "bot_token = \"tok\"\n\
+             [topics]\n\
+             enabled = true\n\
+             owners = [\"555\", \"777\"]\n\
+             default_icon_color = 7322096\n",
+        )
+        .unwrap();
+        assert!(tg.topics.enabled);
+        assert_eq!(tg.topics.owners, vec!["555".to_string(), "777".to_string()]);
+        assert_eq!(tg.topics.default_icon_color, Some(7322096));
+    }
+
+    #[test]
     async fn validate_rejects_reply_min_interval_above_upper_bound() {
         let mut config = Config::default();
         let mut tg = TelegramConfig {
@@ -23644,6 +23697,7 @@ auto_save = true
                         excluded_tools: vec![],
                         reply_min_interval_secs: 0,
                         reply_queue_depth_max: 0,
+                        topics: TopicsConfig::default(),
                     },
                 )]),
                 discord: HashMap::new(),
@@ -24930,6 +24984,7 @@ default_temperature = 0.7
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
+            topics: TopicsConfig::default(),
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -29011,6 +29066,7 @@ high_entropy_tokens = false
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                topics: TopicsConfig::default(),
             },
         );
 

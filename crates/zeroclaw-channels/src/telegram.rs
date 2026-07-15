@@ -6,9 +6,13 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
+use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL, TopicsConfig};
 use zeroclaw_runtime::security::pairing::PairingGuard;
+
+use crate::telegram_topics::{
+    self, TopicCommand, TopicRegistry, TopicStatus, parse_forum_service_event, parse_topic_command,
+};
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
@@ -603,6 +607,11 @@ pub struct TelegramChannel {
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+    /// In-memory forum-topics registry (name<->thread mapping + status).
+    /// Loaded from `<workspace_dir>/telegram-topics.json` at the start of
+    /// `listen`, mutated on observed service events and topic commands, and
+    /// persisted atomically after each mutation.
+    topic_registry: Arc<RwLock<TopicRegistry>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,6 +691,7 @@ impl TelegramChannel {
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            topic_registry: Arc::new(RwLock::new(TopicRegistry::default())),
         }
     }
 
@@ -1031,6 +1041,487 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    // ── Forum topics: config + registry persistence ─────────────────────
+
+    /// Snapshot the per-alias `[channels.telegram.<alias>.topics]` config,
+    /// when a persistence handle is wired (daemon path). `None` in one-shot
+    /// callers/tests that leave `persist` unset.
+    fn alias_topics_config(&self) -> Option<TopicsConfig> {
+        let persist = self.persist.as_ref()?;
+        let cfg = persist.read();
+        cfg.channels
+            .telegram
+            .get(&self.alias)
+            .map(|t| t.topics.clone())
+    }
+
+    fn topics_enabled(&self) -> bool {
+        self.alias_topics_config()
+            .map(|t| t.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Path to the persisted registry, derived from the channel workspace dir.
+    fn topics_state_path(&self) -> Option<std::path::PathBuf> {
+        self.workspace_dir
+            .as_ref()
+            .map(|d| d.join(telegram_topics::TELEGRAM_TOPICS_STATE_FILE))
+    }
+
+    /// Persist the current registry snapshot to disk (best-effort).
+    fn persist_topic_registry(&self) {
+        let Some(path) = self.topics_state_path() else {
+            return;
+        };
+        let snapshot = self.topic_registry.read().clone();
+        if let Err(e) = snapshot.save_atomic(&path) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "failed to persist Telegram topics registry"
+            );
+        }
+    }
+
+    // ── Forum API: thin async glue over the pure builders/parsers ────────
+
+    /// Resolve the bot's numeric user-id, populating the lazy cache via getMe.
+    async fn ensure_bot_id(&self) -> Option<i64> {
+        if let Some(id) = *self.bot_id.lock() {
+            return Some(id);
+        }
+        let _ = self.fetch_bot_username().await; // caches bot_id as a side effect
+        *self.bot_id.lock()
+    }
+
+    async fn get_chat(&self, chat_id: &str) -> anyhow::Result<serde_json::Value> {
+        let body = telegram_topics::build_get_chat_body(chat_id);
+        let resp = self
+            .http_client()
+            .post(self.api_url("getChat"))
+            .json(&body)
+            .send()
+            .await?;
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
+    async fn get_chat_member(
+        &self,
+        chat_id: &str,
+        user_id: i64,
+    ) -> anyhow::Result<serde_json::Value> {
+        let body = telegram_topics::build_get_chat_member_body(chat_id, user_id);
+        let resp = self
+            .http_client()
+            .post(self.api_url("getChatMember"))
+            .json(&body)
+            .send()
+            .await?;
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
+    async fn create_forum_topic(
+        &self,
+        chat_id: &str,
+        name: &str,
+        icon_color: Option<i64>,
+    ) -> anyhow::Result<i64> {
+        let body = telegram_topics::build_create_forum_topic_body(chat_id, name, icon_color);
+        let resp = self
+            .http_client()
+            .post(self.api_url("createForumTopic"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let desc = v
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            anyhow::bail!("{desc}");
+        }
+        telegram_topics::parse_create_forum_topic_response(&v)
+    }
+
+    async fn post_forum_topic_action(
+        &self,
+        method: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let resp = self
+            .http_client()
+            .post(self.api_url(method))
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        let desc = v
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        anyhow::bail!("{desc}");
+    }
+
+    async fn edit_forum_topic(
+        &self,
+        chat_id: &str,
+        thread_id: &str,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        let body = telegram_topics::build_edit_forum_topic_body(chat_id, thread_id, name);
+        self.post_forum_topic_action("editForumTopic", &body).await
+    }
+
+    async fn close_forum_topic(&self, chat_id: &str, thread_id: &str) -> anyhow::Result<()> {
+        let body = telegram_topics::build_close_forum_topic_body(chat_id, thread_id);
+        self.post_forum_topic_action("closeForumTopic", &body).await
+    }
+
+    async fn reopen_forum_topic(&self, chat_id: &str, thread_id: &str) -> anyhow::Result<()> {
+        let body = telegram_topics::build_reopen_forum_topic_body(chat_id, thread_id);
+        self.post_forum_topic_action("reopenForumTopic", &body)
+            .await
+    }
+
+    /// Preflight before creating a topic: verify the chat is a forum and the
+    /// bot can manage topics. Returns an actionable message on failure.
+    async fn preflight_can_create_topic(&self, chat_id: &str) -> Result<(), String> {
+        let chat = self
+            .get_chat(chat_id)
+            .await
+            .map_err(|e| format!("Could not verify the group (getChat failed): {e}"))?;
+        if !telegram_topics::parse_get_chat_is_forum(&chat) {
+            return Err(
+                "This group is not a forum. Enable 'Topics' in the group settings, then try again."
+                    .to_string(),
+            );
+        }
+        let Some(bot_id) = self.ensure_bot_id().await else {
+            return Err("Could not resolve the bot identity (getMe failed).".to_string());
+        };
+        let member = self
+            .get_chat_member(chat_id, bot_id)
+            .await
+            .map_err(|e| format!("Could not verify bot permissions (getChatMember failed): {e}"))?;
+        if !telegram_topics::parse_get_chat_member_can_manage_topics(&member) {
+            return Err(
+                "The bot needs the 'Manage Topics' admin permission in this group.".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a plain-text message (no Markdown parse mode) into an optional topic.
+    async fn reply_topic_text(&self, chat_id: &str, thread_id: Option<&str>, text: &str) {
+        let body = telegram_topics::build_telegram_send_body(chat_id, thread_id, text, None);
+        let _ = self
+            .http_client()
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await;
+    }
+
+    // ── Command interception ────────────────────────────────────────────
+
+    /// Intercept forum service events and owner-gated topic commands before
+    /// the normal message pipeline. Returns `true` when the update was
+    /// consumed — the caller must then `continue` and NOT forward it.
+    async fn handle_topic_update(
+        &self,
+        update: &serde_json::Value,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> bool {
+        let Some(message) = update.get("message") else {
+            return false;
+        };
+
+        // (a) Capture forum_topic_* service events into the registry.
+        if let Some(event) = parse_forum_service_event(message) {
+            if let Some(chat_id) = Self::message_chat_id(message) {
+                {
+                    let mut reg = self.topic_registry.write();
+                    reg.apply_event(&chat_id, &event, Self::now_secs());
+                }
+                self.persist_topic_registry();
+            }
+            return true; // service events never reach the orchestrator
+        }
+
+        // (b) Owner-gated topic commands.
+        let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let Some(command) = parse_topic_command(text) else {
+            return false;
+        };
+
+        let (_username, sender_id, sender_identity) = Self::extract_sender_info(message);
+
+        // /chat_id is a bootstrap helper: never owner-gated, works before the
+        // topics feature is configured.
+        if command == TopicCommand::ChatId {
+            if let Some(chat_id) = Self::message_chat_id(message) {
+                let thread = message
+                    .get("message_thread_id")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|i| i.to_string());
+                // Echo user_id + thread_id too: the setup flow needs the
+                // operator's numeric user_id for the `owners` allowlist, and it
+                // is not otherwise easy to obtain.
+                let user_line = sender_id
+                    .as_deref()
+                    .map(|id| format!("\nyour user_id: {id}"))
+                    .unwrap_or_default();
+                let thread_line = thread
+                    .as_deref()
+                    .map(|t| format!("\nthread_id: {t}"))
+                    .unwrap_or_default();
+                self.reply_topic_text(
+                    &chat_id,
+                    thread.as_deref(),
+                    &format!("chat_id: {chat_id}{user_line}{thread_line}"),
+                )
+                .await;
+            }
+            return true;
+        }
+
+        // All other topic commands require the feature enabled AND an owner.
+        let topics = self.alias_topics_config().unwrap_or_default();
+        if !topics.enabled {
+            return false; // feature off: let the message flow normally
+        }
+        if !telegram_topics::is_owner(sender_id.as_deref(), &topics.owners) {
+            // Reject silently: no API call at all (see the `.expect(0)` tests).
+            return true;
+        }
+
+        let Some(chat_id) = Self::message_chat_id(message) else {
+            return true;
+        };
+        // The topic the command was issued in (None in General).
+        let current_thread = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|i| i.to_string());
+
+        match command {
+            TopicCommand::NewTopic { name, brief } => {
+                self.handle_new_topic(&chat_id, &name, brief, &sender_identity, &topics, tx)
+                    .await;
+            }
+            TopicCommand::ListTopics => {
+                self.handle_list_topics(&chat_id, current_thread.as_deref())
+                    .await;
+            }
+            TopicCommand::RenameTopic { new_name } => {
+                self.handle_rename_topic(&chat_id, current_thread.as_deref(), &new_name)
+                    .await;
+            }
+            TopicCommand::CloseTopic => {
+                self.handle_set_topic_status(&chat_id, current_thread.as_deref(), true)
+                    .await;
+            }
+            TopicCommand::ReopenTopic => {
+                self.handle_set_topic_status(&chat_id, current_thread.as_deref(), false)
+                    .await;
+            }
+            TopicCommand::ChatId => {}
+        }
+        true
+    }
+
+    fn message_chat_id(message: &serde_json::Value) -> Option<String> {
+        message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())
+    }
+
+    async fn handle_new_topic(
+        &self,
+        chat_id: &str,
+        name: &str,
+        brief: Option<String>,
+        sender_identity: &str,
+        topics: &TopicsConfig,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.reply_topic_text(chat_id, None, "Usage: /new_topic <name> [| <brief>]")
+                .await;
+            return;
+        }
+        if let Err(msg) = self.preflight_can_create_topic(chat_id).await {
+            self.reply_topic_text(chat_id, None, &msg).await;
+            return;
+        }
+        let new_id = match self
+            .create_forum_topic(chat_id, name, topics.default_icon_color)
+            .await
+        {
+            Ok(id) => id.to_string(),
+            Err(e) => {
+                self.reply_topic_text(chat_id, None, &format!("Failed to create topic: {e}"))
+                    .await;
+                return;
+            }
+        };
+
+        // Register BEFORE confirming so a confirm failure still persists the
+        // freshly created topic (partial-success handling).
+        {
+            let mut reg = self.topic_registry.write();
+            reg.upsert_created(chat_id, &new_id, name, brief.clone(), Self::now_secs());
+        }
+        self.persist_topic_registry();
+
+        // Confirmation lands in the newly created topic.
+        self.reply_topic_text(
+            chat_id,
+            Some(&new_id),
+            &format!("Created topic \"{name}\" (thread {new_id})."),
+        )
+        .await;
+
+        // Seed the new topic's isolated session with the brief, if provided.
+        if let Some(brief) = brief {
+            let seed = telegram_topics::build_seed_message(
+                &self.alias,
+                chat_id,
+                &new_id,
+                &brief,
+                sender_identity,
+            );
+            let _ = tx.send(seed).await;
+        }
+    }
+
+    async fn handle_list_topics(&self, chat_id: &str, current_thread: Option<&str>) {
+        let topics = self.topic_registry.read().list_for_chat(chat_id);
+        let text = if topics.is_empty() {
+            "No topics tracked yet. Create one with /new_topic <name>.".to_string()
+        } else {
+            let mut out = String::from("Topics:\n");
+            for (thread_id, entry) in &topics {
+                let status = match entry.status {
+                    TopicStatus::Open => "open",
+                    TopicStatus::Closed => "closed",
+                };
+                let _ = writeln!(out, "- {} [{}] (thread {})", entry.name, status, thread_id);
+            }
+            out.trim_end().to_string()
+        };
+        self.reply_topic_text(chat_id, current_thread, &text).await;
+    }
+
+    async fn handle_rename_topic(
+        &self,
+        chat_id: &str,
+        current_thread: Option<&str>,
+        new_name: &str,
+    ) {
+        let Some(thread_id) = current_thread else {
+            self.reply_topic_text(
+                chat_id,
+                None,
+                "Run /rename_topic inside the topic you want to rename.",
+            )
+            .await;
+            return;
+        };
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            self.reply_topic_text(chat_id, Some(thread_id), "Usage: /rename_topic <new name>")
+                .await;
+            return;
+        }
+        if let Err(e) = self.edit_forum_topic(chat_id, thread_id, new_name).await {
+            self.reply_topic_text(
+                chat_id,
+                Some(thread_id),
+                &format!("Failed to rename topic: {e}"),
+            )
+            .await;
+            return;
+        }
+        {
+            let mut reg = self.topic_registry.write();
+            reg.rename(chat_id, thread_id, new_name, Self::now_secs());
+        }
+        self.persist_topic_registry();
+        self.reply_topic_text(
+            chat_id,
+            Some(thread_id),
+            &format!("Renamed topic to \"{new_name}\"."),
+        )
+        .await;
+    }
+
+    /// `close == true` closes the topic; `close == false` reopens it.
+    async fn handle_set_topic_status(
+        &self,
+        chat_id: &str,
+        current_thread: Option<&str>,
+        close: bool,
+    ) {
+        let verb = if close { "close" } else { "reopen" };
+        let Some(thread_id) = current_thread else {
+            self.reply_topic_text(
+                chat_id,
+                None,
+                &format!("Run /{verb}_topic inside the topic you want to {verb}."),
+            )
+            .await;
+            return;
+        };
+        let result = if close {
+            self.close_forum_topic(chat_id, thread_id).await
+        } else {
+            self.reopen_forum_topic(chat_id, thread_id).await
+        };
+        if let Err(e) = result {
+            self.reply_topic_text(
+                chat_id,
+                Some(thread_id),
+                &format!("Failed to {verb} topic: {e}"),
+            )
+            .await;
+            return;
+        }
+        let status = if close {
+            TopicStatus::Closed
+        } else {
+            TopicStatus::Open
+        };
+        {
+            let mut reg = self.topic_registry.write();
+            reg.set_status(chat_id, thread_id, status, Self::now_secs());
+        }
+        self.persist_topic_registry();
+        let done = if close { "Closed" } else { "Reopened" };
+        self.reply_topic_text(chat_id, Some(thread_id), &format!("{done} topic."))
+            .await;
+    }
+
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
     /// Called once at startup so that users see a command menu when pressing `/`.
     /// Includes built-in runtime commands, user-installed skill commands, and
@@ -1043,6 +1534,12 @@ impl TelegramChannel {
             serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
             serde_json::json!({ "command": "models", "description": "List available model_providers or switch model_provider" }),
             serde_json::json!({ "command": "config", "description": "Show current configuration" }),
+            serde_json::json!({ "command": "new_topic", "description": "Create a forum topic: /new_topic <name> [| <brief>]" }),
+            serde_json::json!({ "command": "topics", "description": "List tracked forum topics and their status" }),
+            serde_json::json!({ "command": "rename_topic", "description": "Rename the current forum topic" }),
+            serde_json::json!({ "command": "close_topic", "description": "Close the current forum topic" }),
+            serde_json::json!({ "command": "reopen_topic", "description": "Reopen the current forum topic" }),
+            serde_json::json!({ "command": "chat_id", "description": "Show this chat's numeric id" }),
         ];
 
         // Track registered names to deduplicate across skills and tools.
@@ -2433,6 +2930,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_i64)
             .map(|id| id.to_string());
 
+        // Forum topic detection: `is_topic_message` is set by Telegram only on
+        // messages inside a non-General forum topic. General messages omit both
+        // `message_thread_id` and `is_topic_message`, so they map naturally to
+        // the master (sender-scoped) session.
+        let is_topic_message = message
+            .get("is_topic_message")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        // Non-General forum topics in a topics-enabled group become
+        // room-scoped: one session per topic, independent of sender. General
+        // stays Sender-scoped (owner control channel). Gating on
+        // `topics.enabled` leaves reply-threads in non-forum groups untouched.
+        let conversation_scope = if is_group
+            && is_topic_message
+            && thread_id.is_some()
+            && self.topics_enabled()
+        {
+            ChannelConversationScope::ReplyTarget
+        } else {
+            ChannelConversationScope::Sender
+        };
+
         // reply_target: chat_id or chat_id:thread_id format
         let reply_target = if let Some(ref tid) = thread_id {
             format!("{}:{}", chat_id, tid)
@@ -2461,6 +2981,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content
         };
 
+        // Inject the current topic's name into the turn context. Telegram omits
+        // the topic name on ordinary messages, so surface it from the registry
+        // when this is a tracked (room-scoped) forum topic.
+        let content = if conversation_scope == ChannelConversationScope::ReplyTarget
+            && let Some(tid) = thread_id.as_deref()
+            && let Some(entry) = self.topic_registry.read().get(&chat_id, tid).cloned()
+            && !entry.name.is_empty()
+        {
+            format!(
+                "[Current topic: \"{}\" (thread {tid})]\n\n{content}",
+                entry.name
+            )
+        } else {
+            content
+        };
+
         // Exit input-driven voice mode when user switches back to typing.
         // Config-mandated voice peers (output_modality = "voice") stay in
         // voice mode regardless of whether they send text or voice.
@@ -2485,6 +3021,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            conversation_scope,
 
             ..Default::default()
         })
@@ -2664,16 +3201,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         for (index, chunk) in chunks.iter().enumerate() {
             let text = format_telegram_text_chunk(chunk, index, chunks.len());
 
-            let mut markdown_body = serde_json::json!({
-                "chat_id": chat_id,
-                "text": Self::markdown_to_telegram_html(&text),
-                "parse_mode": "HTML"
-            });
-
-            // Add message_thread_id for forum topic support
-            if let Some(tid) = thread_id {
-                markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-            }
+            let markdown_body = telegram_topics::build_telegram_send_body(
+                chat_id,
+                thread_id,
+                &Self::markdown_to_telegram_html(&text),
+                Some("HTML"),
+            );
 
             let markdown_resp = self
                 .http_client()
@@ -2699,15 +3232,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 "Telegram sendMessage with Markdown failed; retrying without parse_mode"
             );
 
-            let mut plain_body = serde_json::json!({
-                "chat_id": chat_id,
-                "text": text,
-            });
-
-            // Add message_thread_id for forum topic support
-            if let Some(tid) = thread_id {
-                plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-            }
+            let plain_body =
+                telegram_topics::build_telegram_send_body(chat_id, thread_id, &text, None);
             let plain_resp = self
                 .http_client()
                 .post(self.api_url("sendMessage"))
@@ -3740,11 +4266,15 @@ impl Channel for TelegramChannel {
         // Strip tool_call tags before processing to prevent Markdown parsing failures
         let content = strip_tool_call_tags(&message.content);
 
-        // Parse recipient: "chat_id" or "chat_id:thread_id" format
-        let (chat_id, thread_id) = match message.recipient.split_once(':') {
+        // Parse recipient: "chat_id" or "chat_id:thread_id" format. When the
+        // recipient carries no topic, fall back to the message's `thread_ts`
+        // so proactive/cron deliveries aimed at a topic (which set `thread_ts`
+        // via `SendMessage::in_thread`) still land in that topic.
+        let (chat_id, thread_from_recipient) = match message.recipient.split_once(':') {
             Some((chat, thread)) => (chat, Some(thread)),
             None => (message.recipient.as_str(), None),
         };
+        let thread_id = thread_from_recipient.or(message.thread_ts.as_deref());
 
         // Voice chat mode: queue a voice note. Suppressed messages (errors,
         // system notices) are never voiced.
@@ -3892,6 +4422,22 @@ impl Channel for TelegramChannel {
         );
 
         self.register_bot_commands().await;
+
+        // Load the persisted forum-topics registry (name<->thread + status).
+        if let Some(path) = self.topics_state_path() {
+            match TopicRegistry::load(&path) {
+                Ok(reg) => *self.topic_registry.write() = reg,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "failed to load Telegram topics registry; starting empty"
+                    );
+                }
+            }
+        }
 
         loop {
             if self.mention_only {
@@ -4120,6 +4666,13 @@ Ensure only one `zeroclaw` process is using this bot token."
                         }
 
                         continue; // callback_query is not a regular message
+                    }
+
+                    // Intercept forum service events + owner-gated topic
+                    // commands before the normal pipeline. When consumed, the
+                    // update is not forwarded to the orchestrator.
+                    if self.handle_topic_update(update, &tx).await {
+                        continue;
                     }
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
@@ -7832,6 +8385,12 @@ mod tests {
                 { "command": "model",  "description": "Show or switch the current model" },
                 { "command": "models", "description": "List available model_providers or switch model_provider" },
                 { "command": "config", "description": "Show current configuration" },
+                { "command": "new_topic", "description": "Create a forum topic: /new_topic <name> [| <brief>]" },
+                { "command": "topics", "description": "List tracked forum topics and their status" },
+                { "command": "rename_topic", "description": "Rename the current forum topic" },
+                { "command": "close_topic", "description": "Close the current forum topic" },
+                { "command": "reopen_topic", "description": "Reopen the current forum topic" },
+                { "command": "chat_id", "description": "Show this chat's numeric id" },
             ]
         });
 
@@ -7994,6 +8553,12 @@ mod tests {
                 { "command": "model",   "description": "Show or switch the current model" },
                 { "command": "models",  "description": "List available model_providers or switch model_provider" },
                 { "command": "config",  "description": "Show current configuration" },
+                { "command": "new_topic", "description": "Create a forum topic: /new_topic <name> [| <brief>]" },
+                { "command": "topics", "description": "List tracked forum topics and their status" },
+                { "command": "rename_topic", "description": "Rename the current forum topic" },
+                { "command": "close_topic", "description": "Close the current forum topic" },
+                { "command": "reopen_topic", "description": "Reopen the current forum topic" },
+                { "command": "chat_id", "description": "Show this chat's numeric id" },
                 { "command": "weather", "description": "Check the weather forecast" },
             ]
         });
@@ -8037,6 +8602,12 @@ mod tests {
                 { "command": "model",     "description": "Show or switch the current model" },
                 { "command": "models",    "description": "List available model_providers or switch model_provider" },
                 { "command": "config",    "description": "Show current configuration" },
+                { "command": "new_topic", "description": "Create a forum topic: /new_topic <name> [| <brief>]" },
+                { "command": "topics", "description": "List tracked forum topics and their status" },
+                { "command": "rename_topic", "description": "Rename the current forum topic" },
+                { "command": "close_topic", "description": "Close the current forum topic" },
+                { "command": "reopen_topic", "description": "Reopen the current forum topic" },
+                { "command": "chat_id", "description": "Show this chat's numeric id" },
                 { "command": "test_tool", "description": "A test tool" },
             ]
         });
@@ -8166,5 +8737,690 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    // ── Forum topics: scope + session-key continuity (Phase 1) ──────────
+
+    /// Build a channel whose alias has `[topics] enabled = true` + `owners`.
+    fn topics_channel(alias: &str, owners: Vec<String>) -> TelegramChannel {
+        use zeroclaw_config::schema::{Config, TelegramConfig, TopicsConfig};
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: "tok".into(),
+                topics: TopicsConfig {
+                    enabled: true,
+                    owners,
+                    default_icon_color: None,
+                },
+                ..Default::default()
+            },
+        );
+        TelegramChannel::new(
+            "tok".into(),
+            alias.to_string(),
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence(Arc::new(RwLock::new(config)))
+    }
+
+    fn forum_topic_update(from_id: i64, username: &str, chat_id: i64, thread_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "text": "hello",
+                "from": { "id": from_id, "username": username },
+                "chat": { "id": chat_id, "type": "supergroup" },
+                "message_thread_id": thread_id,
+                "is_topic_message": true
+            }
+        })
+    }
+
+    fn general_update(from_id: i64, username: &str, chat_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "text": "hello",
+                "from": { "id": from_id, "username": username },
+                "chat": { "id": chat_id, "type": "supergroup" }
+            }
+        })
+    }
+
+    fn command_update(text: &str, from_id: i64, chat_id: i64, thread_id: Option<i64>) -> serde_json::Value {
+        let mut message = serde_json::json!({
+            "message_id": 11,
+            "text": text,
+            "from": { "id": from_id, "username": "owner" },
+            "chat": { "id": chat_id, "type": "supergroup" }
+        });
+        if let Some(t) = thread_id {
+            message["message_thread_id"] = serde_json::json!(t);
+            message["is_topic_message"] = serde_json::json!(true);
+        }
+        serde_json::json!({ "update_id": 1, "message": message })
+    }
+
+    #[test]
+    fn forum_topic_message_sets_replytarget_scope_when_enabled() {
+        let ch = topics_channel("work", vec![]);
+        let msg = ch
+            .parse_update_message(&forum_topic_update(555, "alice", -100_200_300, 789))
+            .expect("topic message parses");
+        assert_eq!(msg.conversation_scope, ChannelConversationScope::ReplyTarget);
+        assert_eq!(msg.reply_target, "-100200300:789");
+        assert_eq!(msg.thread_ts.as_deref(), Some("789"));
+    }
+
+    #[test]
+    fn topic_context_injected_for_known_topic() {
+        let ch = topics_channel("work", vec![]);
+        ch.topic_registry
+            .write()
+            .upsert_created("-100200300", "789", "Design", None, 0);
+        let msg = ch
+            .parse_update_message(&forum_topic_update(555, "alice", -100_200_300, 789))
+            .expect("topic message parses");
+        assert!(
+            msg.content
+                .starts_with("[Current topic: \"Design\" (thread 789)]"),
+            "known topic name is injected as context; got: {}",
+            msg.content
+        );
+        assert!(msg.content.contains("hello"));
+    }
+
+    #[test]
+    fn general_stays_sender_scoped() {
+        let ch = topics_channel("work", vec![]);
+        let msg = ch
+            .parse_update_message(&general_update(555, "alice", -100_200_300))
+            .expect("general message parses");
+        assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
+        assert_eq!(msg.reply_target, "-100200300");
+        assert_eq!(msg.thread_ts, None);
+    }
+
+    #[test]
+    fn general_topic_routes_to_master_session() {
+        let ch = topics_channel("work", vec![]);
+        let general = ch
+            .parse_update_message(&general_update(555, "alice", -100_200_300))
+            .unwrap();
+        let topic = ch
+            .parse_update_message(&forum_topic_update(555, "alice", -100_200_300, 789))
+            .unwrap();
+        let general_key = crate::orchestrator::conversation_history_key(&general);
+        let topic_key = crate::orchestrator::conversation_history_key(&topic);
+        // General is its own (master) session, distinct from any topic session.
+        assert_ne!(general_key, topic_key);
+        // The master session is sender-scoped: it embeds the sender identity.
+        assert!(general_key.contains("alice"));
+    }
+
+    #[test]
+    fn plain_reply_thread_not_treated_as_topic() {
+        // A message with a thread id but WITHOUT `is_topic_message` (an ordinary
+        // reply thread, not a forum topic) stays Sender-scoped even when topics
+        // are enabled.
+        let ch = topics_channel("work", vec![]);
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "text": "hello",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "message_thread_id": 42
+            }
+        });
+        let msg = ch.parse_update_message(&update).expect("parses");
+        assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
+    }
+
+    #[test]
+    fn topic_session_key_is_sender_independent() {
+        let ch = topics_channel("work", vec![]);
+        let alice = ch
+            .parse_update_message(&forum_topic_update(555, "alice", -100_200_300, 789))
+            .unwrap();
+        let bob = ch
+            .parse_update_message(&forum_topic_update(999, "bob", -100_200_300, 789))
+            .unwrap();
+        assert_eq!(
+            crate::orchestrator::conversation_history_key(&alice),
+            crate::orchestrator::conversation_history_key(&bob),
+            "a topic is exactly one session regardless of who posts"
+        );
+    }
+
+    #[test]
+    fn seed_and_followup_share_topic_key() {
+        let ch = topics_channel("work", vec![]);
+        let seed = crate::telegram_topics::build_seed_message(
+            "work",
+            "-100200300",
+            "789",
+            "draft the RFC",
+            "555",
+        );
+        let followup = ch
+            .parse_update_message(&forum_topic_update(999, "bob", -100_200_300, 789))
+            .unwrap();
+        assert_eq!(
+            crate::orchestrator::conversation_history_key(&seed),
+            crate::orchestrator::conversation_history_key(&followup),
+            "the seed and later replies share the topic's session"
+        );
+    }
+
+    // ── Forum topics: commands + forum API (Phase 2, wiremock) ──────────
+
+    #[tokio::test]
+    async fn new_topic_creates_and_confirms() {
+        use wiremock::matchers::{body_json, body_partial_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "id": 42, "username": "bot" } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChat$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "is_forum": true } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChatMember$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "status": "administrator", "can_manage_topics": true }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/createForumTopic$"))
+            .and(body_json(
+                serde_json::json!({ "chat_id": "-100200300", "name": "Design" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_thread_id": 789, "name": "Design" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_partial_json(serde_json::json!({
+                "chat_id": "-100200300",
+                "text": "Created topic \"Design\" (thread 789).",
+                "message_thread_id": "789"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let consumed = ch
+            .handle_topic_update(&command_update("/new_topic Design", 555, -100_200_300, None), &tx)
+            .await;
+        assert!(consumed);
+        assert!(
+            ch.topic_registry.read().get("-100200300", "789").is_some(),
+            "new topic must be registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_topic_with_brief_seeds_session() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "id": 42, "username": "bot" } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChat$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "is_forum": true } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChatMember$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "status": "creator" }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/createForumTopic$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_thread_id": 789, "name": "Design" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let consumed = ch
+            .handle_topic_update(
+                &command_update("/new_topic Design | draft the RFC", 555, -100_200_300, None),
+                &tx,
+            )
+            .await;
+        assert!(consumed);
+        let seed = rx.try_recv().expect("brief seeds a message");
+        assert_eq!(seed.reply_target, "-100200300:789");
+        assert_eq!(seed.thread_ts.as_deref(), Some("789"));
+        assert_eq!(seed.conversation_scope, ChannelConversationScope::ReplyTarget);
+        assert!(seed.explicitly_addressed);
+        assert_eq!(seed.content, "draft the RFC");
+    }
+
+    #[tokio::test]
+    async fn preflight_non_forum_errors() {
+        use wiremock::matchers::{any, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChat$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "is_forum": false } }),
+            ))
+            .mount(&mock)
+            .await;
+        // No topic must be created for a non-forum group.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/createForumTopic$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        // Error reply is allowed (unasserted).
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": {} }),
+            ))
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let consumed = ch
+            .handle_topic_update(&command_update("/new_topic Design", 555, -100_200_300, None), &tx)
+            .await;
+        assert!(consumed);
+        assert!(ch.topic_registry.read().list_for_chat("-100200300").is_empty());
+    }
+
+    #[tokio::test]
+    async fn preflight_missing_manage_topics_errors() {
+        use wiremock::matchers::{any, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "id": 42, "username": "bot" } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChat$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "is_forum": true } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChatMember$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "status": "member", "can_manage_topics": false }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/createForumTopic$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": {} }),
+            ))
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let consumed = ch
+            .handle_topic_update(&command_update("/new_topic Design", 555, -100_200_300, None), &tx)
+            .await;
+        assert!(consumed);
+        assert!(ch.topic_registry.read().list_for_chat("-100200300").is_empty());
+    }
+
+    #[tokio::test]
+    async fn preflight_creator_allowed() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "id": 42, "username": "bot" } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChat$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "is_forum": true } }),
+            ))
+            .mount(&mock)
+            .await;
+        // Creator member object omits `can_manage_topics` but is allowed.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChatMember$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "status": "creator" } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/createForumTopic$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_thread_id": 789, "name": "Design" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        ch.handle_topic_update(&command_update("/new_topic Design", 555, -100_200_300, None), &tx)
+            .await;
+        assert!(
+            ch.topic_registry.read().get("-100200300", "789").is_some(),
+            "creator is allowed to create topics"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_owner_command_makes_no_api_call() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        // Sender 999 is not an owner.
+        let consumed = ch
+            .handle_topic_update(&command_update("/new_topic Design", 999, -100_200_300, None), &tx)
+            .await;
+        assert!(consumed, "non-owner command is consumed silently");
+        // Mock verifies `.expect(0)` on drop: no API call was made.
+    }
+
+    #[tokio::test]
+    async fn rename_topic_calls_correct_method_and_body() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editForumTopic$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "-100200300",
+                "message_thread_id": "789",
+                "name": "Architecture"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        ch.handle_topic_update(
+            &command_update("/rename_topic Architecture", 555, -100_200_300, Some(789)),
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            ch.topic_registry.read().get("-100200300", "789").unwrap().name,
+            "Architecture"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_topic_calls_correct_method_and_body() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/closeForumTopic$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "-100200300", "message_thread_id": "789"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        ch.handle_topic_update(
+            &command_update("/close_topic", 555, -100_200_300, Some(789)),
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            ch.topic_registry.read().get("-100200300", "789").unwrap().status,
+            crate::telegram_topics::TopicStatus::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_topic_calls_correct_method_and_body() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/reopenForumTopic$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "-100200300", "message_thread_id": "789"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        ch.handle_topic_update(
+            &command_update("/reopen_topic", 555, -100_200_300, Some(789)),
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            ch.topic_registry.read().get("-100200300", "789").unwrap().status,
+            crate::telegram_topics::TopicStatus::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn create_ok_confirm_fails_still_registers() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "id": 42, "username": "bot" } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChat$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "is_forum": true } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChatMember$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "status": "creator" }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/createForumTopic$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_thread_id": 789, "name": "Design" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        // Confirmation delivery fails, but the topic is already registered.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(
+                serde_json::json!({ "ok": false, "description": "Internal Server Error" }),
+            ))
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel("work", vec!["555".into()]).with_api_base(mock.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        ch.handle_topic_update(&command_update("/new_topic Design", 555, -100_200_300, None), &tx)
+            .await;
+        assert!(
+            ch.topic_registry.read().get("-100200300", "789").is_some(),
+            "topic is registered even when the confirmation send fails"
+        );
+    }
+
+    // ── Forum topics: schedule/proactive delivery to a topic (Phase 3) ──
+
+    #[tokio::test]
+    async fn scheduled_delivery_targets_topic() {
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_partial_json(serde_json::json!({
+                "chat_id": "-100200300",
+                "message_thread_id": "789"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "tok".into(),
+            "work",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock.uri());
+        // Recipient carries no topic; the topic id rides on `thread_ts`
+        // (as set by `deliver_announcement`'s `SendMessage::in_thread`).
+        let msg = SendMessage::new("hello", "-100200300").in_thread(Some("789".into()));
+        Channel::send(&ch, &msg).await.expect("send succeeds");
     }
 }
