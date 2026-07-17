@@ -30,13 +30,19 @@ Edit `~/.zeroclaw/config.toml` (adjust the `telegram` alias to yours):
 ```toml
 [channels.telegram.telegram]
 # ...existing bot config...
-group_ids = ["-1001234567890"]     # the forum supergroup from step 3
 
 [channels.telegram.telegram.topics]
 enabled = true
+group_id = "-1001234567890"            # the forum supergroup from step 3 (master group)
 owners  = ["<your_numeric_user_id>"]   # numeric IDs only; who may run topic commands
-default_icon_color = 7322096            # optional; Telegram preset color
+agent_managed = true                   # optional (default true); allow the `telegram_topic` tool to manage topics
+default_icon_color = 7322096           # optional; Telegram preset color
 ```
+
+> Note: Telegram has **no** `group_ids` field — that setting belongs to Signal.
+> The forum supergroup for topics is set with `group_id` under
+> `[channels.telegram.<alias>.topics]`, and it is the only group the
+> agent-callable `telegram_topic` tool and topic-targeted schedules will act on.
 
 Then restart the daemon:
 

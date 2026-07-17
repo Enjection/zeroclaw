@@ -493,6 +493,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         )
     }
 
+    /// Downcast hook for callers that need the concrete channel type.
+    ///
+    /// Used by the orchestrator to dispatch forum-topic operations to the live
+    /// Telegram channel instance (which owns the authoritative in-memory
+    /// name↔thread registry) after looking it up in the cron channel registry.
+    /// Default `None`; channels that support concrete-type dispatch return
+    /// `Some(self)`, and wrappers (e.g. the pacing wrapper) forward to their
+    /// inner channel so the concrete type stays reachable through the wrapper.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Whether an inbound message is a direct, one-to-one conversation
     /// with the bot (a DM/IM), as opposed to a group or broadcast
     /// channel. A direct message is definitionally addressed to the

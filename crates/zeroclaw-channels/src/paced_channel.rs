@@ -384,6 +384,13 @@ impl Channel for PacedChannel {
         self.inner.listen(tx).await
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        // Forward to the wrapped channel so concrete-type dispatch (e.g. forum
+        // topic ops on the live Telegram channel) still resolves through the
+        // pacing wrapper.
+        self.inner.as_any()
+    }
+
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
     }

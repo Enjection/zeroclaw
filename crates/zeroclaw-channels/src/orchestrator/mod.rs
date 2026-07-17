@@ -10978,6 +10978,62 @@ pub async fn start_channels(
 /// from the recipient (notably the webhook channel, which serialises both into
 /// the JSON callback). For channels that do not honour `thread_ts` it is a
 /// harmless no-op.
+/// Perform a forum-topic operation against the live Telegram channel for
+/// `alias`, resolved from [`CRON_CHANNEL_REGISTRY`].
+///
+/// Mirrors the [`deliver_announcement`] bridge: the binary registers a closure
+/// (`zeroclaw_runtime::topics::register_topic_op_fn`) that calls this. The op
+/// runs against the *live* listening channel instance so it shares that
+/// instance's authoritative in-memory topic registry (name↔thread mappings,
+/// open/closed status) rather than a freshly built, empty one. Returns a clear
+/// error when the channel is not currently live — agent-driven topic ops are
+/// only valid while the channel runtime is running.
+#[cfg(feature = "channel-telegram")]
+pub async fn perform_topic_op(
+    _config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    chat_id: &str,
+    op: zeroclaw_runtime::topics::TopicOp,
+) -> anyhow::Result<zeroclaw_runtime::topics::TopicOpOutcome> {
+    // Snapshot the Arc out of the sync RwLock before awaiting.
+    let snapshot = CRON_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let channel = snapshot.as_ref().and_then(|reg| {
+        reg.get(&format!("telegram.{alias}"))
+            .or_else(|| reg.get("telegram"))
+            .cloned()
+    });
+    let Some(channel) = channel else {
+        anyhow::bail!(
+            "Telegram channel '{alias}' is not live; topic operations require the channel \
+             runtime to be running"
+        );
+    };
+    let tg = channel
+        .as_any()
+        .and_then(|any| any.downcast_ref::<TelegramChannel>())
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "channel '{alias}' is not a Telegram channel; cannot perform topic operations"
+            ))
+        })?;
+    tg.run_topic_op(chat_id, op).await
+}
+
+/// Feature-absent stub: keeps the binary's registration closure compiling on
+/// builds without the Telegram channel.
+#[cfg(not(feature = "channel-telegram"))]
+pub async fn perform_topic_op(
+    _config: &zeroclaw_config::schema::Config,
+    _alias: &str,
+    _chat_id: &str,
+    _op: zeroclaw_runtime::topics::TopicOp,
+) -> anyhow::Result<zeroclaw_runtime::topics::TopicOpOutcome> {
+    anyhow::bail!("Telegram channel requires the `channel-telegram` feature")
+}
+
 pub async fn deliver_announcement(
     config: &zeroclaw_config::schema::Config,
     channel: &str,

@@ -13134,7 +13134,7 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 /// When `enabled`, non-General forum topics become room-scoped conversation
 /// sessions (one session per topic) and owner-gated `/new_topic`, `/topics`,
 /// `/rename_topic`, `/close_topic`, `/reopen_topic` commands manage them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.telegram.topics"]
 pub struct TopicsConfig {
@@ -13152,6 +13152,32 @@ pub struct TopicsConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub default_icon_color: Option<i64>,
+    /// The master forum-group chat_id that the agent tool and topic-targeted
+    /// schedules operate on. Agent-driven operations never accept an arbitrary
+    /// chat_id from the model — the group is fixed here by the operator.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// Whether the agent-callable `telegram_topic` tool may manage topics.
+    /// Defaults to `true`; set `false` to keep topic management strictly
+    /// owner-command-driven while leaving the feature otherwise enabled.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub agent_managed: bool,
+}
+
+impl Default for TopicsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            owners: Vec::new(),
+            default_icon_color: None,
+            group_id: None,
+            // Mirror the serde default so `Default::default()` and a missing
+            // `agent_managed` key agree (both `true`).
+            agent_managed: true,
+        }
+    }
 }
 
 /// Telegram bot channel configuration.
@@ -22731,23 +22757,52 @@ enabled = true
     #[test]
     async fn telegram_topics_config_serde_defaults() {
         // Omitting the [topics] table yields a disabled, empty default.
+        // group_id defaults to None; agent_managed defaults to true.
         let tg: TelegramConfig = toml::from_str("bot_token = \"tok\"").unwrap();
         assert!(!tg.topics.enabled);
         assert!(tg.topics.owners.is_empty());
         assert_eq!(tg.topics.default_icon_color, None);
+        assert_eq!(tg.topics.group_id, None);
+        assert!(
+            tg.topics.agent_managed,
+            "agent_managed must default to true when omitted"
+        );
 
-        // A populated [topics] table round-trips.
+        // Present-but-partial [topics] table: agent_managed still defaults true.
+        let tg: TelegramConfig = toml::from_str(
+            "bot_token = \"tok\"\n\
+             [topics]\n\
+             enabled = true\n",
+        )
+        .unwrap();
+        assert!(tg.topics.enabled);
+        assert!(
+            tg.topics.agent_managed,
+            "agent_managed must default true even when [topics] is present"
+        );
+        assert_eq!(tg.topics.group_id, None);
+
+        // A populated [topics] table round-trips, including an explicit
+        // agent_managed = false and a master group_id.
         let tg: TelegramConfig = toml::from_str(
             "bot_token = \"tok\"\n\
              [topics]\n\
              enabled = true\n\
              owners = [\"555\", \"777\"]\n\
-             default_icon_color = 7322096\n",
+             default_icon_color = 7322096\n\
+             group_id = \"-100200300\"\n\
+             agent_managed = false\n",
         )
         .unwrap();
         assert!(tg.topics.enabled);
         assert_eq!(tg.topics.owners, vec!["555".to_string(), "777".to_string()]);
         assert_eq!(tg.topics.default_icon_color, Some(7322096));
+        assert_eq!(tg.topics.group_id, Some("-100200300".to_string()));
+        assert!(!tg.topics.agent_managed);
+
+        // The in-code Default mirrors the serde default (agent_managed = true).
+        assert!(TopicsConfig::default().agent_managed);
+        assert_eq!(TopicsConfig::default().group_id, None);
     }
 
     #[test]

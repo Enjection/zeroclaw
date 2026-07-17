@@ -40,6 +40,7 @@ pub mod skills;
 pub mod sop;
 pub mod subagent;
 pub mod tools;
+pub mod topics;
 pub mod trust;
 pub mod tunnel;
 pub mod verifiable_intent;

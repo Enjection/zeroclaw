@@ -1522,6 +1522,143 @@ impl TelegramChannel {
             .await;
     }
 
+    /// Run a runtime-bridged forum-topic operation against this live channel.
+    ///
+    /// Called from `orchestrator::perform_topic_op` after it resolves this
+    /// instance from the cron channel registry. Unlike the owner-command
+    /// handlers (`handle_*`), which act on the *current* topic derived from the
+    /// inbound message, agent-tool and schedule-driven ops address topics by
+    /// **name**, resolved against this channel's authoritative in-memory
+    /// registry. Confirmations are not posted to Telegram here — the returned
+    /// [`TopicOpOutcome`] is surfaced to the caller (the tool / scheduler).
+    pub(crate) async fn run_topic_op(
+        &self,
+        chat_id: &str,
+        op: zeroclaw_runtime::topics::TopicOp,
+    ) -> anyhow::Result<zeroclaw_runtime::topics::TopicOpOutcome> {
+        use zeroclaw_runtime::topics::{TopicOp, TopicOpOutcome};
+
+        match op {
+            TopicOp::Create { name, brief } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    anyhow::bail!("topic name must not be empty");
+                }
+                if let Err(msg) = self.preflight_can_create_topic(chat_id).await {
+                    anyhow::bail!("{msg}");
+                }
+                let icon = self
+                    .alias_topics_config()
+                    .and_then(|t| t.default_icon_color);
+                let new_id = self.create_forum_topic(chat_id, name, icon).await?.to_string();
+                {
+                    let mut reg = self.topic_registry.write();
+                    reg.upsert_created(chat_id, &new_id, name, brief.clone(), Self::now_secs());
+                }
+                self.persist_topic_registry();
+                Ok(TopicOpOutcome {
+                    message: format!("Created topic \"{name}\" (thread {new_id})."),
+                    thread_id: Some(new_id),
+                })
+            }
+            TopicOp::List => {
+                let topics = self.topic_registry.read().list_for_chat(chat_id);
+                let message = if topics.is_empty() {
+                    "No topics tracked yet. Create one first.".to_string()
+                } else {
+                    let mut out = String::from("Topics:\n");
+                    for (thread_id, entry) in &topics {
+                        let status = match entry.status {
+                            TopicStatus::Open => "open",
+                            TopicStatus::Closed => "closed",
+                        };
+                        let _ =
+                            writeln!(out, "- {} [{}] (thread {})", entry.name, status, thread_id);
+                    }
+                    out.trim_end().to_string()
+                };
+                Ok(TopicOpOutcome {
+                    message,
+                    thread_id: None,
+                })
+            }
+            TopicOp::Rename { name, new_name } => {
+                let thread_id = self.resolve_topic_thread_or_err(chat_id, &name)?;
+                let new_name = new_name.trim();
+                if new_name.is_empty() {
+                    anyhow::bail!("new topic name must not be empty");
+                }
+                self.edit_forum_topic(chat_id, &thread_id, new_name).await?;
+                {
+                    let mut reg = self.topic_registry.write();
+                    reg.rename(chat_id, &thread_id, new_name, Self::now_secs());
+                }
+                self.persist_topic_registry();
+                Ok(TopicOpOutcome {
+                    message: format!(
+                        "Renamed topic \"{name}\" to \"{new_name}\" (thread {thread_id})."
+                    ),
+                    thread_id: Some(thread_id),
+                })
+            }
+            TopicOp::Close { name } => {
+                let thread_id = self.resolve_topic_thread_or_err(chat_id, &name)?;
+                self.close_forum_topic(chat_id, &thread_id).await?;
+                {
+                    let mut reg = self.topic_registry.write();
+                    reg.set_status(chat_id, &thread_id, TopicStatus::Closed, Self::now_secs());
+                }
+                self.persist_topic_registry();
+                Ok(TopicOpOutcome {
+                    message: format!("Closed topic \"{name}\" (thread {thread_id})."),
+                    thread_id: Some(thread_id),
+                })
+            }
+            TopicOp::Reopen { name } => {
+                let thread_id = self.resolve_topic_thread_or_err(chat_id, &name)?;
+                self.reopen_forum_topic(chat_id, &thread_id).await?;
+                {
+                    let mut reg = self.topic_registry.write();
+                    reg.set_status(chat_id, &thread_id, TopicStatus::Open, Self::now_secs());
+                }
+                self.persist_topic_registry();
+                Ok(TopicOpOutcome {
+                    message: format!("Reopened topic \"{name}\" (thread {thread_id})."),
+                    thread_id: Some(thread_id),
+                })
+            }
+            TopicOp::ResolveThreadId { name } => {
+                let thread_id = self
+                    .topic_registry
+                    .read()
+                    .resolve_thread_id_by_name(chat_id, &name);
+                match thread_id {
+                    Some(tid) => Ok(TopicOpOutcome {
+                        message: format!("Topic \"{name}\" is thread {tid}."),
+                        thread_id: Some(tid),
+                    }),
+                    None => Ok(TopicOpOutcome {
+                        message: format!("No topic named \"{name}\" is tracked."),
+                        thread_id: None,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Resolve a topic name to its numeric thread id within a chat, erroring
+    /// clearly when it is not tracked in the registry.
+    fn resolve_topic_thread_or_err(&self, chat_id: &str, name: &str) -> anyhow::Result<String> {
+        self.topic_registry
+            .read()
+            .resolve_thread_id_by_name(chat_id, name)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "No topic named \"{name}\" is tracked in this group; create it first."
+                ))
+            })
+    }
+
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
     /// Called once at startup so that users see a command menu when pressing `/`.
     /// Includes built-in runtime commands, user-installed skill commands, and
@@ -3865,6 +4002,12 @@ impl ::zeroclaw_api::attribution::Attributable for TelegramChannel {
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
         "telegram"
+    }
+
+    /// Expose the concrete type so the orchestrator can dispatch forum-topic
+    /// operations to this live instance (see [`TelegramChannel::run_topic_op`]).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     /// Telegram's `getMe` username, populated lazily by
@@ -8754,6 +8897,7 @@ mod tests {
                     enabled: true,
                     owners,
                     default_icon_color: None,
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -8862,6 +9006,224 @@ mod tests {
         assert_ne!(general_key, topic_key);
         // The master session is sender-scoped: it embeds the sender identity.
         assert!(general_key.contains("alice"));
+    }
+
+    /// Like [`topics_channel`] but points the HTTP seam at a wiremock server so
+    /// the forum API glue (`getChat`/`getChatMember`/`createForumTopic`/…) can
+    /// be exercised. Topics are enabled with no owners.
+    fn topics_channel_with_base(base: String) -> TelegramChannel {
+        use zeroclaw_config::schema::{Config, TelegramConfig, TopicsConfig};
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "work".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: "tok".into(),
+                topics: TopicsConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        TelegramChannel::new(
+            "tok".into(),
+            "work".to_string(),
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence(Arc::new(RwLock::new(config)))
+        .with_api_base(base)
+    }
+
+    #[test]
+    fn telegram_channel_downcasts_through_trait_object_and_pacing_wrapper() {
+        use crate::paced_channel::PacedChannel;
+        use zeroclaw_config::schema::HasReplyPacing;
+
+        // Common path: pacing disabled, so the cron registry holds the bare
+        // Telegram channel as a trait object.
+        let bare: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(topics_channel("work", vec![]));
+        assert!(
+            bare.as_any()
+                .and_then(|a| a.downcast_ref::<TelegramChannel>())
+                .is_some(),
+            "bare Telegram channel must downcast via as_any"
+        );
+
+        // Paced path: the wrapper must forward as_any to the inner channel so
+        // the concrete type stays reachable.
+        struct Pacing;
+        impl HasReplyPacing for Pacing {
+            fn reply_min_interval_secs(&self) -> u64 {
+                5
+            }
+            fn reply_queue_depth_max(&self) -> u16 {
+                4
+            }
+        }
+        let inner: Arc<dyn zeroclaw_api::channel::Channel> =
+            Arc::new(topics_channel("work", vec![]));
+        let paced = PacedChannel::wrap(inner, &Pacing);
+        assert!(
+            paced
+                .as_any()
+                .and_then(|a| a.downcast_ref::<TelegramChannel>())
+                .is_some(),
+            "PacedChannel must forward as_any to the wrapped Telegram channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_topic_op_create_preflights_and_registers() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChat$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "is_forum": true } }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getChatMember$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "status": "administrator", "can_manage_topics": true }
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/createForumTopic$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_thread_id": 789, "name": "Design" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel_with_base(mock.uri());
+        *ch.bot_id.lock() = Some(4242); // skip getMe in preflight
+
+        let outcome = ch
+            .run_topic_op(
+                "-100200300",
+                zeroclaw_runtime::topics::TopicOp::Create {
+                    name: "Design".into(),
+                    brief: Some("draft".into()),
+                },
+            )
+            .await
+            .expect("create ok");
+        assert_eq!(outcome.thread_id.as_deref(), Some("789"));
+        let entry = ch
+            .topic_registry
+            .read()
+            .get("-100200300", "789")
+            .cloned()
+            .expect("topic registered");
+        assert_eq!(entry.name, "Design");
+        assert_eq!(entry.purpose.as_deref(), Some("draft"));
+    }
+
+    #[tokio::test]
+    async fn run_topic_op_list_and_resolve_read_registry() {
+        let ch = topics_channel("work", vec![]);
+        ch.topic_registry
+            .write()
+            .upsert_created("-100200300", "789", "Design", None, 0);
+        ch.topic_registry
+            .write()
+            .upsert_created("-100200300", "790", "Planning", None, 0);
+
+        let list = ch
+            .run_topic_op("-100200300", zeroclaw_runtime::topics::TopicOp::List)
+            .await
+            .unwrap();
+        assert!(list.message.contains("Design"));
+        assert!(list.message.contains("Planning"));
+        assert!(list.thread_id.is_none());
+
+        let resolved = ch
+            .run_topic_op(
+                "-100200300",
+                zeroclaw_runtime::topics::TopicOp::ResolveThreadId {
+                    name: "planning".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.thread_id.as_deref(), Some("790"));
+
+        let miss = ch
+            .run_topic_op(
+                "-100200300",
+                zeroclaw_runtime::topics::TopicOp::ResolveThreadId {
+                    name: "ghost".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(miss.thread_id, None);
+    }
+
+    #[tokio::test]
+    async fn run_topic_op_rename_unknown_name_errors() {
+        let ch = topics_channel("work", vec![]);
+        let err = ch
+            .run_topic_op(
+                "-100200300",
+                zeroclaw_runtime::topics::TopicOp::Rename {
+                    name: "ghost".into(),
+                    new_name: "x".into(),
+                },
+            )
+            .await;
+        assert!(err.is_err(), "renaming an untracked topic must error");
+    }
+
+    #[tokio::test]
+    async fn run_topic_op_close_resolves_name_and_updates_status() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/closeForumTopic$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let ch = topics_channel_with_base(mock.uri());
+        ch.topic_registry
+            .write()
+            .upsert_created("-100200300", "789", "Design", None, 0);
+
+        let outcome = ch
+            .run_topic_op(
+                "-100200300",
+                zeroclaw_runtime::topics::TopicOp::Close {
+                    name: "Design".into(),
+                },
+            )
+            .await
+            .expect("close ok");
+        assert_eq!(outcome.thread_id.as_deref(), Some("789"));
+        assert_eq!(
+            ch.topic_registry
+                .read()
+                .get("-100200300", "789")
+                .unwrap()
+                .status,
+            TopicStatus::Closed
+        );
     }
 
     #[test]

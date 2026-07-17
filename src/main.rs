@@ -3761,6 +3761,23 @@ async fn main() -> Result<()> {
                 })
             },
         ));
+
+        // Wire forum-topic operations to the channels orchestrator, mirroring
+        // the cron delivery bridge above. The agent-callable `telegram_topic`
+        // tool and topic-targeted schedules call
+        // `zeroclaw_runtime::topics::perform_topic_op`, which dispatches through
+        // this handler to the live Telegram channel. `register_topic_op_fn` is
+        // idempotent (backed by `OnceLock::set`).
+        zeroclaw_runtime::topics::register_topic_op_fn(Box::new(
+            |config, alias, chat_id, op| {
+                Box::pin(async move {
+                    zeroclaw_channels::orchestrator::perform_topic_op(
+                        &config, &alias, &chat_id, op,
+                    )
+                    .await
+                })
+            },
+        ));
     }
 
     #[cfg(feature = "agent-runtime")]

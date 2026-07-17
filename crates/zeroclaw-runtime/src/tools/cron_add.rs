@@ -19,6 +19,33 @@ pub struct CronAddTool {
     agent_alias: String,
 }
 
+/// Resolve the Telegram alias whose forum topics an agent's schedules should
+/// target: the first `telegram[.alias]` channel the agent listens on that has a
+/// `topics.group_id` configured. Used to resolve `delivery.topic` names.
+fn agent_telegram_topics_alias(config: &Config, agent_alias: &str) -> Option<String> {
+    config
+        .agents
+        .get(agent_alias)?
+        .channels
+        .iter()
+        .filter_map(|c| {
+            let s = c.as_str();
+            if s == "telegram" {
+                Some("default".to_string())
+            } else {
+                s.strip_prefix("telegram.").map(str::to_string)
+            }
+        })
+        .find(|alias| {
+            config
+                .channels
+                .telegram
+                .get(alias)
+                .and_then(|t| t.topics.group_id.as_deref())
+                .is_some_and(|g| !g.trim().is_empty())
+        })
+}
+
 impl CronAddTool {
     pub fn new(
         config: Arc<Config>,
@@ -170,6 +197,9 @@ impl Tool for CronAddTool {
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          For webhook deliveries that must thread through the originating conversation, also set \
          delivery.thread_id=\"<reply_target>\". \
+         To deliver into a Telegram forum topic, set delivery.channel=\"telegram\" and \
+         delivery.topic=\"<topic name>\"; the topic name is resolved to its thread at \
+         schedule-creation time and `to` defaults to the configured master group. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
 
@@ -275,6 +305,10 @@ impl Tool for CronAddTool {
                         "thread_id": {
                             "type": "string",
                             "description": "Optional thread/conversation identifier. Used by the webhook channel to route callbacks to the originating conversation; ignored by channels whose threading is implied by `to`."
+                        },
+                        "topic": {
+                            "type": "string",
+                            "description": "Optional. For a Telegram channel, the NAME of a forum topic to deliver into. Resolved to its numeric thread at schedule-creation time; when set, `to` defaults to the configured master group."
                         },
                         "best_effort": {
                             "type": "boolean",
@@ -383,7 +417,7 @@ impl Tool for CronAddTool {
             .get("approved")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let delivery = match args.get("delivery") {
+        let mut delivery = match args.get("delivery") {
             Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
                 Ok(cfg) => Some(cfg),
                 Err(e) => {
@@ -396,6 +430,84 @@ impl Tool for CronAddTool {
             },
             None => None,
         };
+
+        // Telegram forum-topic targeting: resolve the topic NAME to its numeric
+        // thread id now, at schedule-creation time, so the delivery path only
+        // ever carries the resolved id (avoids the delivery layer reading the
+        // registry file at fire time). `topic` is not a `DeliveryConfig` field,
+        // so it is read from the raw args.
+        let topic = args
+            .get("delivery")
+            .and_then(|d| d.get("topic"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let (Some(topic), Some(cfg)) = (topic, delivery.as_mut()) {
+            let is_telegram = cfg
+                .channel
+                .as_deref()
+                .is_some_and(|c| c == "telegram" || c.starts_with("telegram."));
+            if is_telegram {
+                let alias = cfg
+                    .channel
+                    .as_deref()
+                    .and_then(|c| c.strip_prefix("telegram.").map(str::to_string))
+                    .or_else(|| agent_telegram_topics_alias(&self.config, &self.agent_alias))
+                    .unwrap_or_else(|| "default".to_string());
+                let group_id = self
+                    .config
+                    .channels
+                    .telegram
+                    .get(&alias)
+                    .and_then(|t| t.topics.group_id.clone())
+                    .filter(|g| !g.trim().is_empty());
+                let Some(group_id) = group_id else {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "delivery.topic requires [channels.telegram.{alias}.topics].group_id to be set"
+                        )),
+                    });
+                };
+                match crate::topics::perform_topic_op(
+                    &self.config,
+                    &alias,
+                    &group_id,
+                    crate::topics::TopicOp::ResolveThreadId {
+                        name: topic.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok(outcome) => match outcome.thread_id {
+                        Some(tid) => {
+                            cfg.thread_id = Some(tid);
+                            if cfg.to.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                                cfg.to = Some(group_id);
+                            }
+                        }
+                        None => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: ToolOutput::default(),
+                                error: Some(format!(
+                                    "No Telegram topic named {topic:?} is tracked in the master group; create it first."
+                                )),
+                            });
+                        }
+                    },
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!("Failed to resolve Telegram topic {topic:?}: {e:#}")),
+                        });
+                    }
+                }
+            }
+        }
 
         let result = match job_type {
             JobType::Shell => {
@@ -678,6 +790,87 @@ mod tests {
         assert_eq!(jobs[0].delivery.channel.as_deref(), Some("discord"));
         assert_eq!(jobs[0].delivery.to.as_deref(), Some("1234567890"));
         assert!(jobs[0].delivery.best_effort);
+    }
+
+    /// Build a config where `test-agent` listens on `telegram.work` and that
+    /// channel has a master forum group configured.
+    async fn config_with_telegram_topics(tmp: &TempDir) -> Arc<Config> {
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        config.agents.get_mut(TEST_AGENT).unwrap().channels =
+            vec![zeroclaw_config::providers::ChannelRef::new("telegram.work")];
+        config.channels.telegram.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "tok".into(),
+                enabled: true,
+                topics: zeroclaw_config::schema::TopicsConfig {
+                    enabled: true,
+                    group_id: Some("-100200300".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn delivery_topic_resolves_to_thread_id_and_defaults_to() {
+        crate::topics::register_echo_topic_op_fn();
+        let tmp = TempDir::new().unwrap();
+        let cfg = config_with_telegram_topics(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": { "mode": "announce", "channel": "telegram", "topic": "planning" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        // Echo handler resolves the reserved name "planning" -> "4242".
+        assert_eq!(jobs[0].delivery.thread_id.as_deref(), Some("4242"));
+        // `to` defaults to the configured master group when omitted.
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("-100200300"));
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("telegram"));
+    }
+
+    #[tokio::test]
+    async fn delivery_topic_unknown_name_fails_clearly() {
+        crate::topics::register_echo_topic_op_fn();
+        let tmp = TempDir::new().unwrap();
+        let cfg = config_with_telegram_topics(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": { "mode": "announce", "channel": "telegram", "topic": "does-not-exist" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result.error.unwrap().contains("No Telegram topic"),
+            "unknown topic must fail clearly"
+        );
+        // No job should have been created.
+        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
     }
 
     #[tokio::test]
