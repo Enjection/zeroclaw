@@ -1715,7 +1715,21 @@ impl TelegramChannel {
             None
         };
         let thread_id = thread_id.or(fallback_thread.as_deref());
-        let body = crate::memorizer_bridge::build_mc_send_body(chat_id, thread_id, &question)?;
+        // A math question ($…$) renders as typeset LaTeX via sendRichMessage;
+        // plain questions stay on the proven sendMessage path. The rich builder
+        // puts formula-bearing options in the body (button labels can't render
+        // LaTeX) with A/B/C buttons carrying the same `memq:` index.
+        let (endpoint, body) = if crate::memorizer_bridge::needs_rich(prompt, options) {
+            (
+                "sendRichMessage",
+                crate::memorizer_bridge::build_rich_mc_send_body(chat_id, thread_id, &question)?,
+            )
+        } else {
+            (
+                "sendMessage",
+                crate::memorizer_bridge::build_mc_send_body(chat_id, thread_id, &question)?,
+            )
+        };
 
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps a button before the sender is in the map.
@@ -1727,7 +1741,7 @@ impl TelegramChannel {
 
         let resp = self
             .http_client()
-            .post(self.api_url("sendMessage"))
+            .post(self.api_url(endpoint))
             .json(&body)
             .send()
             .await;
@@ -1738,7 +1752,7 @@ impl TelegramChannel {
                 let status = r.status();
                 let err = r.text().await.unwrap_or_default();
                 self.pending_choices.lock().await.remove(&choice_id);
-                anyhow::bail!("Telegram sendMessage (mc_choice) failed ({status}): {err}");
+                anyhow::bail!("Telegram {endpoint} (mc_choice) failed ({status}): {err}");
             }
             Err(e) => {
                 self.pending_choices.lock().await.remove(&choice_id);
@@ -4965,9 +4979,13 @@ Ensure only one `zeroclaw` process is using this bot token."
                                 );
                             }
 
-                            // Update the message in place: drop the inline
-                            // keyboard so the buttons don't linger after a tap
-                            // is recorded.
+                            // Drop the inline keyboard so the buttons don't
+                            // linger after a tap. A rich (sendRichMessage)
+                            // question has no plain `text`, and editMessageText
+                            // would REPLACE its typeset LaTeX body — so clear
+                            // only the keyboard via editMessageReplyMarkup and
+                            // leave the formula intact; a classic message keeps
+                            // the append-a-note behaviour.
                             if let Some(message) = cb.get("message")
                                 && let Some(msg_chat_id) = message
                                     .get("chat")
@@ -4976,24 +4994,38 @@ Ensure only one `zeroclaw` process is using this bot token."
                                 && let Some(message_id) =
                                     message.get("message_id").and_then(serde_json::Value::as_i64)
                             {
-                                let original = message
-                                    .get("text")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default();
-                                let edited_text = if original.is_empty() {
-                                    "✓ recorded".to_string()
+                                let (endpoint, edit_body) = if message.get("rich_message").is_some() {
+                                    (
+                                        "editMessageReplyMarkup",
+                                        serde_json::json!({
+                                            "chat_id": msg_chat_id,
+                                            "message_id": message_id,
+                                            "reply_markup": { "inline_keyboard": [] },
+                                        }),
+                                    )
                                 } else {
-                                    format!("{original}\n\n✓ recorded")
+                                    let original = message
+                                        .get("text")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or_default();
+                                    let edited_text = if original.is_empty() {
+                                        "✓ recorded".to_string()
+                                    } else {
+                                        format!("{original}\n\n✓ recorded")
+                                    };
+                                    (
+                                        "editMessageText",
+                                        serde_json::json!({
+                                            "chat_id": msg_chat_id,
+                                            "message_id": message_id,
+                                            "text": edited_text,
+                                            "reply_markup": { "inline_keyboard": [] },
+                                        }),
+                                    )
                                 };
-                                let edit_body = serde_json::json!({
-                                    "chat_id": msg_chat_id,
-                                    "message_id": message_id,
-                                    "text": edited_text,
-                                    "reply_markup": { "inline_keyboard": [] },
-                                });
                                 if let Err(e) = self
                                     .http_client()
-                                    .post(self.api_url("editMessageText"))
+                                    .post(self.api_url(endpoint))
                                     .json(&edit_body)
                                     .send()
                                     .await
@@ -5006,7 +5038,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                                         )
                                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                                         .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                                        "editMessageText (mc_choice) failed"
+                                        "editMessage (mc_choice keyboard clear) failed"
                                     );
                                 }
                             }
