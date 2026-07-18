@@ -625,6 +625,11 @@ pub struct TelegramChannel {
     /// thread. The choice tool is context-free, so this is how the current
     /// thread reaches it.
     active_thread: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
+    /// Markdown source of each in-flight rich MC message, keyed by `message_id`.
+    /// A rich (sendRichMessage) message has no plain `text` to append to, so on a
+    /// `memq:` tap we re-render the stored markdown + "✓ recorded" via
+    /// editMessageText's `rich_message` param. Inserted on send, removed on tap.
+    sent_rich_markdown: Arc<std::sync::Mutex<std::collections::HashMap<i64, String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -707,6 +712,7 @@ impl TelegramChannel {
             approval_timeout_secs: 120,
             topic_registry: Arc::new(RwLock::new(TopicRegistry::default())),
             active_thread: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sent_rich_markdown: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -1715,21 +1721,17 @@ impl TelegramChannel {
             None
         };
         let thread_id = thread_id.or(fallback_thread.as_deref());
-        // A math question ($…$) renders as typeset LaTeX via sendRichMessage;
-        // plain questions stay on the proven sendMessage path. The rich builder
-        // puts formula-bearing options in the body (button labels can't render
-        // LaTeX) with A/B/C buttons carrying the same `memq:` index.
-        let (endpoint, body) = if crate::memorizer_bridge::needs_rich(prompt, options) {
-            (
-                "sendRichMessage",
-                crate::memorizer_bridge::build_rich_mc_send_body(chat_id, thread_id, &question)?,
-            )
-        } else {
-            (
-                "sendMessage",
-                crate::memorizer_bridge::build_mc_send_body(chat_id, thread_id, &question)?,
-            )
-        };
+        // All MC questions go through sendRichMessage so the agent's **bold**
+        // framing (and any $…$ LaTeX) renders as markdown instead of showing
+        // literal asterisks — plain `sendMessage` does not parse markdown. The
+        // builder keeps plain option text on the buttons and only falls back to
+        // A/B/C-in-body when an option carries math.
+        let body = crate::memorizer_bridge::build_rich_mc_send_body(chat_id, thread_id, &question)?;
+        // Keep the markdown source so the post-tap edit can re-render it + "recorded".
+        let rich_markdown = body["rich_message"]["markdown"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps a button before the sender is in the map.
@@ -1741,18 +1743,31 @@ impl TelegramChannel {
 
         let resp = self
             .http_client()
-            .post(self.api_url(endpoint))
+            .post(self.api_url("sendRichMessage"))
             .json(&body)
             .send()
             .await;
 
         match resp {
-            Ok(r) if r.status().is_success() => {}
+            Ok(r) if r.status().is_success() => {
+                // Record message_id → markdown so the tap handler can re-render
+                // the question with a "✓ recorded" note (rich messages have no
+                // plain text to append to).
+                if let Ok(js) = r.json::<serde_json::Value>().await
+                    && let Some(mid) = js
+                        .get("result")
+                        .and_then(|x| x.get("message_id"))
+                        .and_then(serde_json::Value::as_i64)
+                    && let Ok(mut map) = self.sent_rich_markdown.lock()
+                {
+                    map.insert(mid, rich_markdown);
+                }
+            }
             Ok(r) => {
                 let status = r.status();
                 let err = r.text().await.unwrap_or_default();
                 self.pending_choices.lock().await.remove(&choice_id);
-                anyhow::bail!("Telegram {endpoint} (mc_choice) failed ({status}): {err}");
+                anyhow::bail!("Telegram sendRichMessage (mc_choice) failed ({status}): {err}");
             }
             Err(e) => {
                 self.pending_choices.lock().await.remove(&choice_id);
@@ -4995,14 +5010,34 @@ Ensure only one `zeroclaw` process is using this bot token."
                                     message.get("message_id").and_then(serde_json::Value::as_i64)
                             {
                                 let (endpoint, edit_body) = if message.get("rich_message").is_some() {
-                                    (
-                                        "editMessageReplyMarkup",
-                                        serde_json::json!({
-                                            "chat_id": msg_chat_id,
-                                            "message_id": message_id,
-                                            "reply_markup": { "inline_keyboard": [] },
-                                        }),
-                                    )
+                                    // Rich message: re-render the stored markdown + a "recorded"
+                                    // note and clear the keyboard (editMessageText would blank a
+                                    // rich body if given no rich_message). If the source is gone
+                                    // (e.g. after a restart) just drop the keyboard.
+                                    let stored = self
+                                        .sent_rich_markdown
+                                        .lock()
+                                        .ok()
+                                        .and_then(|mut m| m.remove(&message_id));
+                                    match stored {
+                                        Some(md) => (
+                                            "editMessageText",
+                                            serde_json::json!({
+                                                "chat_id": msg_chat_id,
+                                                "message_id": message_id,
+                                                "rich_message": { "markdown": format!("{md}\n\n✓ recorded") },
+                                                "reply_markup": { "inline_keyboard": [] },
+                                            }),
+                                        ),
+                                        None => (
+                                            "editMessageReplyMarkup",
+                                            serde_json::json!({
+                                                "chat_id": msg_chat_id,
+                                                "message_id": message_id,
+                                                "reply_markup": { "inline_keyboard": [] },
+                                            }),
+                                        ),
+                                    }
                                 } else {
                                     let original = message
                                         .get("text")
@@ -9144,8 +9179,10 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
+        // MC prompts now go through sendRichMessage (markdown/LaTeX rendering),
+        // not plain sendMessage.
         Mock::given(method("POST"))
-            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "ok": true, "result": { "message_id": 1 } })),

@@ -69,64 +69,26 @@ pub fn memq_callback_data(short_qid: &str, idx: usize) -> String {
     format!("{MEMQ_PREFIX}{short_qid}:{idx}")
 }
 
-/// Build a `sendMessage` body that renders a multiple-choice question as a
-/// vertical inline keyboard (one button per option). `thread_id` targets the
-/// deck's forum topic. Errors if any button's `callback_data` would exceed
-/// Telegram's 64-byte limit.
-pub fn build_mc_send_body(
-    chat_id: &str,
-    thread_id: Option<&str>,
-    q: &PendingQuestion,
-) -> anyhow::Result<Value> {
-    let mut rows: Vec<Value> = Vec::with_capacity(q.options.len());
-    for (idx, opt) in q.options.iter().enumerate() {
-        let data = memq_callback_data(&q.short_qid, idx);
-        if data.len() > CALLBACK_DATA_MAX {
-            anyhow::bail!(
-                "callback_data {data:?} is {} bytes, over Telegram's {CALLBACK_DATA_MAX}-byte limit",
-                data.len(),
-            );
-        }
-        rows.push(json!([{ "text": opt, "callback_data": data }]));
-    }
-    let mut body = json!({
-        "chat_id": chat_id,
-        "text": q.front,
-        "reply_markup": { "inline_keyboard": rows },
-    });
-    if let Some(tid) = thread_id {
-        body["message_thread_id"] = Value::String(tid.to_string());
-    }
-    Ok(body)
-}
-
-/// True when the question carries a math marker (`$`) in its front or any
-/// option, so it should be rendered via `sendRichMessage` (LaTeX) instead of a
-/// plain `sendMessage`. Single source of truth for the render decision.
-pub fn needs_rich(front: &str, options: &[String]) -> bool {
-    front.contains('$') || options.iter().any(|o| o.contains('$'))
-}
-
 fn letter_for(idx: usize) -> char {
     (b'A' + (idx as u8 % 26)) as char
 }
 
-/// Build a `sendRichMessage` body for a math multiple-choice question: the front
-/// plus a lettered option list rendered as markdown (LaTeX preserved), with
-/// inline buttons labelled `A/B/C…` — Telegram button labels can't render LaTeX,
-/// so the formula-bearing options live in the body and the buttons carry only
-/// the letter. `callback_data` still encodes the option index, so a letter maps
-/// 1:1 to its index. `thread_id` targets the deck's forum topic.
+/// Build a `sendRichMessage` body for a multiple-choice question. The front is
+/// rendered as markdown so the agent's **bold** framing and any `$…$` LaTeX both
+/// typeset (used for ALL MC questions — plain `sendMessage` shows markdown
+/// literally). When an option contains math, options are listed in the body with
+/// A/B/C buttons (button labels can't render LaTeX); otherwise the option text
+/// sits on the button. `callback_data` carries the option index either way.
+/// `thread_id` targets the deck's forum topic.
 pub fn build_rich_mc_send_body(
     chat_id: &str,
     thread_id: Option<&str>,
     q: &PendingQuestion,
 ) -> anyhow::Result<Value> {
+    let options_have_math = q.options.iter().any(|o| o.contains('$'));
     let mut md = q.front.clone();
     let mut rows: Vec<Value> = Vec::with_capacity(q.options.len());
     for (idx, opt) in q.options.iter().enumerate() {
-        let letter = letter_for(idx);
-        md.push_str(&format!("\n\n{}) {}", letter, opt));
         let data = memq_callback_data(&q.short_qid, idx);
         if data.len() > CALLBACK_DATA_MAX {
             anyhow::bail!(
@@ -134,7 +96,16 @@ pub fn build_rich_mc_send_body(
                 data.len(),
             );
         }
-        rows.push(json!([{ "text": letter.to_string(), "callback_data": data }]));
+        // Button labels can't render LaTeX: when an option carries math, list the
+        // options in the body (A) …) with A/B/C buttons; otherwise put the option
+        // text directly on the button (nicer to tap).
+        if options_have_math {
+            let letter = letter_for(idx);
+            md.push_str(&format!("\n\n{}) {}", letter, opt));
+            rows.push(json!([{ "text": letter.to_string(), "callback_data": data }]));
+        } else {
+            rows.push(json!([{ "text": opt, "callback_data": data }]));
+        }
     }
     let mut body = json!({
         "chat_id": chat_id,
@@ -267,28 +238,32 @@ mod tests {
     }
 
     #[test]
-    fn build_mc_body_one_button_per_option_with_memq_data() {
-        let body = build_mc_send_body("-100200300", Some("42"), &sample()).unwrap();
+    fn mc_plain_options_put_text_on_buttons() {
+        // No math → option text on the buttons (nicer to tap); front is markdown.
+        let body = build_rich_mc_send_body("-100200300", Some("42"), &sample()).unwrap();
+        assert!(body["rich_message"]["markdown"].as_str().unwrap().contains("2+2?"));
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb.len(), 3);
         assert_eq!(body["message_thread_id"], Value::String("42".into()));
-        assert_eq!(kb[0][0]["text"], "3");
+        assert_eq!(kb[0][0]["text"], "3"); // option text, not a letter
         assert_eq!(kb[0][0]["callback_data"], "memq:q1:0");
         assert_eq!(kb[2][0]["callback_data"], "memq:q1:2");
     }
 
-    #[test]
-    fn needs_rich_detects_dollar_in_front_or_options() {
-        assert!(needs_rich("what is $x^2$?", &[]));
-        assert!(needs_rich("plain", &["$\\frac12$".into(), "one".into()]));
-        assert!(!needs_rich("plain front", &["a".into(), "b".into()]));
-        assert!(!needs_rich("no options", &[]));
+    fn math_sample() -> PendingQuestion {
+        PendingQuestion {
+            short_qid: "q1".into(),
+            deck_id: String::new(),
+            qtype: "mc".into(),
+            front: "pick".into(),
+            options: vec!["$\\tfrac12$".into(), "$1$".into(), "$2$".into()],
+        }
     }
 
     #[test]
-    fn rich_body_has_markdown_and_lettered_buttons() {
-        let body = build_rich_mc_send_body("-100200300", Some("42"), &sample()).unwrap();
-        assert!(body["rich_message"]["markdown"].as_str().unwrap().contains("2+2?"));
+    fn rich_math_options_use_lettered_buttons_and_body() {
+        // Options carry math → A/B/C buttons, option text in the body.
+        let body = build_rich_mc_send_body("-100200300", Some("42"), &math_sample()).unwrap();
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb.len(), 3);
         assert_eq!(body["message_thread_id"], Value::String("42".into()));
@@ -298,13 +273,13 @@ mod tests {
 
     #[test]
     fn rich_letters_map_to_callback_index() {
-        let body = build_rich_mc_send_body("-1", None, &sample()).unwrap();
+        let body = build_rich_mc_send_body("-1", None, &math_sample()).unwrap();
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb[0][0]["callback_data"], "memq:q1:0");
         assert_eq!(kb[2][0]["callback_data"], "memq:q1:2");
         let md = body["rich_message"]["markdown"].as_str().unwrap();
-        assert!(md.contains("A) 3"), "{md}");
-        assert!(md.contains("C) 5"), "{md}");
+        assert!(md.contains("A) $\\tfrac12$"), "{md}");
+        assert!(md.contains("C) $2$"), "{md}");
     }
 
     #[test]
@@ -338,13 +313,6 @@ mod tests {
         let md = body["rich_message"]["markdown"].as_str().unwrap();
         assert!(md.contains("**Question 1**"), "markdown bold must pass through: {md}");
         assert!(md.contains("$\\frac{1}{2}$"), "math must be verbatim: {md}");
-    }
-
-    #[test]
-    fn build_mc_body_rejects_oversize_callback_data() {
-        let mut big = sample();
-        big.short_qid = "x".repeat(70);
-        assert!(build_mc_send_body("-1", None, &big).is_err());
     }
 
     #[tokio::test]
