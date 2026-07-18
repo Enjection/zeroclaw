@@ -617,6 +617,14 @@ pub struct TelegramChannel {
     /// `listen`, mutated on observed service events and topic commands, and
     /// persisted atomically after each mutation.
     topic_registry: Arc<RwLock<TopicRegistry>>,
+    /// Most recent inbound thread per chat (`chat_id` → `Some(thread_id)` for a
+    /// forum topic, `None` for General). Updated whenever a message is
+    /// dispatched to the agent; read by [`TelegramChannel::render_choice`] so an
+    /// agent-driven inline-button prompt (`telegram_mc_choice`) lands in the
+    /// topic the conversation is actually in rather than the group's General
+    /// thread. The choice tool is context-free, so this is how the current
+    /// thread reaches it.
+    active_thread: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,6 +706,7 @@ impl TelegramChannel {
             pending_choices: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
             topic_registry: Arc::new(RwLock::new(TopicRegistry::default())),
+            active_thread: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -1693,6 +1702,19 @@ impl TelegramChannel {
             front: prompt.to_string(),
             options: options.to_vec(),
         };
+        // The choice tool is context-free, so callers pass `thread_id = None`.
+        // Fall back to the chat's current conversation thread so the buttons
+        // render in-topic rather than in the group's General thread.
+        let fallback_thread = if thread_id.is_none() {
+            self.active_thread
+                .lock()
+                .ok()
+                .and_then(|m| m.get(chat_id).cloned())
+                .flatten()
+        } else {
+            None
+        };
+        let thread_id = thread_id.or(fallback_thread.as_deref());
         let body = crate::memorizer_bridge::build_mc_send_body(chat_id, thread_id, &question)?;
 
         // Register the oneshot BEFORE sending the message to avoid a race
@@ -3235,6 +3257,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             && let Ok(mut vc) = self.voice_chats.lock()
         {
             vc.remove(&reply_target);
+        }
+
+        // Track the thread this chat's conversation is currently in, so an
+        // agent-driven inline-button prompt during this turn (telegram_mc_choice,
+        // which is context-free) renders in the same topic rather than General.
+        if let Ok(mut at) = self.active_thread.lock() {
+            at.insert(chat_id.clone(), thread_id.clone());
         }
 
         Some(ChannelMessage {
