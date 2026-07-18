@@ -111,56 +111,6 @@ fn letter_for(idx: usize) -> char {
     (b'A' + (idx as u8 % 26)) as char
 }
 
-/// Backslash-escape markdown inline-formatting characters, but ONLY outside
-/// `$…$` / `$$…$$` math spans — the math is handed to the renderer verbatim so
-/// `\frac`, `\int`, `_`, `^` survive, while stray `_`/`*`/`` ` `` in the plain
-/// prose (e.g. `H_2O`) can't be misread as emphasis.
-fn segment_escape(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    let mut out = String::with_capacity(s.len());
-    let mut j = 0;
-    while j < n {
-        if chars[j] == '$' {
-            let block = j + 1 < n && chars[j + 1] == '$';
-            let delim = if block { 2 } else { 1 };
-            let mut k = j + delim;
-            let mut closed = false;
-            while k < n {
-                if chars[k] == '$' {
-                    if block {
-                        if k + 1 < n && chars[k + 1] == '$' {
-                            k += 2;
-                            closed = true;
-                            break;
-                        }
-                    } else {
-                        k += 1;
-                        closed = true;
-                        break;
-                    }
-                }
-                k += 1;
-            }
-            if closed {
-                out.extend(&chars[j..k]); // math span verbatim (delimiters included)
-                j = k;
-                continue;
-            }
-            out.push('$'); // unterminated '$' is not a formatting char → literal
-            j += 1;
-        } else {
-            let c = chars[j];
-            if matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '~') {
-                out.push('\\');
-            }
-            out.push(c);
-            j += 1;
-        }
-    }
-    out
-}
-
 /// Build a `sendRichMessage` body for a math multiple-choice question: the front
 /// plus a lettered option list rendered as markdown (LaTeX preserved), with
 /// inline buttons labelled `A/B/C…` — Telegram button labels can't render LaTeX,
@@ -172,11 +122,11 @@ pub fn build_rich_mc_send_body(
     thread_id: Option<&str>,
     q: &PendingQuestion,
 ) -> anyhow::Result<Value> {
-    let mut md = segment_escape(&q.front);
+    let mut md = q.front.clone();
     let mut rows: Vec<Value> = Vec::with_capacity(q.options.len());
     for (idx, opt) in q.options.iter().enumerate() {
         let letter = letter_for(idx);
-        md.push_str(&format!("\n\n{}) {}", letter, segment_escape(opt)));
+        md.push_str(&format!("\n\n{}) {}", letter, opt));
         let data = memq_callback_data(&q.short_qid, idx);
         if data.len() > CALLBACK_DATA_MAX {
             anyhow::bail!(
@@ -370,7 +320,9 @@ mod tests {
     }
 
     #[test]
-    fn segment_escape_preserves_math_escapes_plain() {
+    fn rich_body_passes_markdown_and_math_verbatim() {
+        // The front is markdown: intentional **bold** must survive unchanged
+        // (escaping it would print literal asterisks), and $…$ LaTeX stays verbatim.
         let body = build_rich_mc_send_body(
             "-1",
             None,
@@ -378,13 +330,13 @@ mod tests {
                 short_qid: "q".into(),
                 deck_id: String::new(),
                 qtype: "mc".into(),
-                front: "see H_2O and $\\frac{1}{2}$".into(),
+                front: "**Question 1** — evaluate $\\frac{1}{2}$".into(),
                 options: vec!["a".into(), "b".into()],
             },
         )
         .unwrap();
         let md = body["rich_message"]["markdown"].as_str().unwrap();
-        assert!(md.contains("H\\_2O"), "plain underscore must be escaped: {md}");
+        assert!(md.contains("**Question 1**"), "markdown bold must pass through: {md}");
         assert!(md.contains("$\\frac{1}{2}$"), "math must be verbatim: {md}");
     }
 
