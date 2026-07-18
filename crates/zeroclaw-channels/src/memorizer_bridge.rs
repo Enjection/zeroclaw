@@ -80,16 +80,63 @@ fn letter_for(idx: usize) -> char {
 /// A/B/C buttons (button labels can't render LaTeX); otherwise the option text
 /// sits on the button. `callback_data` carries the option index either way.
 /// `thread_id` targets the deck's forum topic.
+/// Options that reference their own position ("all of the above", "none of the
+/// below", …) become nonsense when reordered, so such a card must keep its
+/// original option order. Returns false when any option looks position-bound.
+pub fn options_shuffle_safe(options: &[String]) -> bool {
+    !options.iter().any(|o| {
+        let l = o.trim().to_lowercase();
+        l.contains("of the above")
+            || l.contains("of the below")
+            || l.starts_with("all of ")
+            || l.starts_with("none of ")
+            || l.starts_with("any of ")
+            || l.starts_with("both ")
+            || l.starts_with("neither ")
+            || l == "all of them"
+            || l == "none of them"
+    })
+}
+
+/// Display order (a permutation of `0..options.len()`) for an MC card. Random
+/// each call so a repeat viewer can't learn "the answer is always B" — unless an
+/// option is position-referential, in which case the original order is kept.
+/// The callback for each button always carries the ORIGINAL index (see
+/// [`build_rich_mc_send_body_ordered`]), so grading is order-independent.
+pub fn mc_display_order(options: &[String]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..options.len()).collect();
+    if options_shuffle_safe(options) {
+        use rand::seq::SliceRandom;
+        order.shuffle(&mut rand::rng());
+    }
+    order
+}
+
 pub fn build_rich_mc_send_body(
     chat_id: &str,
     thread_id: Option<&str>,
     q: &PendingQuestion,
 ) -> anyhow::Result<Value> {
+    build_rich_mc_send_body_ordered(chat_id, thread_id, q, &mc_display_order(&q.options))
+}
+
+/// Build the sendRichMessage body presenting `q.options` in `order` (a
+/// permutation of the option indices). Button letters/positions follow the
+/// display order, but each button's `callback_data` encodes the option's
+/// ORIGINAL index — so whichever option the user taps grades against the stored
+/// answer regardless of how it was shuffled on screen.
+pub fn build_rich_mc_send_body_ordered(
+    chat_id: &str,
+    thread_id: Option<&str>,
+    q: &PendingQuestion,
+    order: &[usize],
+) -> anyhow::Result<Value> {
     let options_have_math = q.options.iter().any(|o| o.contains('$'));
     let mut md = q.front.clone();
-    let mut rows: Vec<Value> = Vec::with_capacity(q.options.len());
-    for (idx, opt) in q.options.iter().enumerate() {
-        let data = memq_callback_data(&q.short_qid, idx);
+    let mut rows: Vec<Value> = Vec::with_capacity(order.len());
+    for (display_pos, &orig) in order.iter().enumerate() {
+        let opt = &q.options[orig];
+        let data = memq_callback_data(&q.short_qid, orig);
         if data.len() > CALLBACK_DATA_MAX {
             anyhow::bail!(
                 "callback_data {data:?} is {} bytes, over Telegram's {CALLBACK_DATA_MAX}-byte limit",
@@ -98,9 +145,10 @@ pub fn build_rich_mc_send_body(
         }
         // Button labels can't render LaTeX: when an option carries math, list the
         // options in the body (A) …) with A/B/C buttons; otherwise put the option
-        // text directly on the button (nicer to tap).
+        // text directly on the button (nicer to tap). Letters follow the on-screen
+        // order; the callback still points at the original option.
         if options_have_math {
-            let letter = letter_for(idx);
+            let letter = letter_for(display_pos);
             md.push_str(&format!("\n\n{}) {}", letter, opt));
             rows.push(json!([{ "text": letter.to_string(), "callback_data": data }]));
         } else {
@@ -240,7 +288,8 @@ mod tests {
     #[test]
     fn mc_plain_options_put_text_on_buttons() {
         // No math → option text on the buttons (nicer to tap); front is markdown.
-        let body = build_rich_mc_send_body("-100200300", Some("42"), &sample()).unwrap();
+        // Identity order to assert the exact mapping deterministically.
+        let body = build_rich_mc_send_body_ordered("-100200300", Some("42"), &sample(), &[0, 1, 2]).unwrap();
         assert!(body["rich_message"]["markdown"].as_str().unwrap().contains("2+2?"));
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb.len(), 3);
@@ -273,13 +322,56 @@ mod tests {
 
     #[test]
     fn rich_letters_map_to_callback_index() {
-        let body = build_rich_mc_send_body("-1", None, &math_sample()).unwrap();
+        // Identity order: letter A/C line up with option index 0/2.
+        let body = build_rich_mc_send_body_ordered("-1", None, &math_sample(), &[0, 1, 2]).unwrap();
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb[0][0]["callback_data"], "memq:q1:0");
         assert_eq!(kb[2][0]["callback_data"], "memq:q1:2");
         let md = body["rich_message"]["markdown"].as_str().unwrap();
         assert!(md.contains("A) $\\tfrac12$"), "{md}");
         assert!(md.contains("C) $2$"), "{md}");
+    }
+
+    #[test]
+    fn options_shuffle_safe_flags_positional_options() {
+        assert!(options_shuffle_safe(&["3".into(), "4".into(), "5".into()]));
+        assert!(!options_shuffle_safe(&["3".into(), "4".into(), "All of the above".into()]));
+        assert!(!options_shuffle_safe(&["None of the above".into(), "x".into()]));
+        assert!(!options_shuffle_safe(&["both A and B".into(), "x".into()]));
+        assert!(!options_shuffle_safe(&["all of them".into(), "x".into()]));
+    }
+
+    #[test]
+    fn mc_display_order_is_a_permutation() {
+        let opts = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let mut ord = mc_display_order(&opts);
+        assert_eq!(ord.len(), 4);
+        ord.sort();
+        assert_eq!(ord, vec![0, 1, 2, 3]); // every original index present exactly once
+    }
+
+    #[test]
+    fn mc_display_order_keeps_referential_options_in_place() {
+        let opts = vec!["a".into(), "b".into(), "all of the above".into()];
+        assert_eq!(mc_display_order(&opts), vec![0, 1, 2]); // never shuffled
+    }
+
+    #[test]
+    fn shuffled_body_preserves_original_index_mapping() {
+        // Whatever the on-screen order, each button's callback must resolve to the
+        // option it displays — so grading (by index or text) stays correct.
+        let q = sample(); // options ["3","4","5"]
+        let order = [2usize, 0, 1];
+        let body = build_rich_mc_send_body_ordered("-1", None, &q, &order).unwrap();
+        let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
+        for (display_pos, &orig) in order.iter().enumerate() {
+            let btn = &kb[display_pos][0];
+            assert_eq!(btn["text"], q.options[orig]); // shows the original option text
+            assert_eq!(
+                btn["callback_data"],
+                format!("memq:q1:{orig}") // callback carries the ORIGINAL index
+            );
+        }
     }
 
     #[test]
