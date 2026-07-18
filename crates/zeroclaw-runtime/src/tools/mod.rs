@@ -33,6 +33,7 @@ pub mod scoped;
 pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
+pub mod telegram_mc_choice;
 pub mod telegram_topic;
 pub mod skill_http;
 pub mod skill_manage;
@@ -150,6 +151,7 @@ pub use schedule::ScheduleTool;
 pub use security_ops::SecurityOpsTool;
 pub use send_message_to_peer::SendMessageToPeerTool;
 pub use shell::ShellTool;
+pub use telegram_mc_choice::TelegramMcChoiceTool;
 pub use telegram_topic::TelegramTopicTool;
 pub use skill_http::SkillHttpTool;
 pub use skill_tool::{SkillBuiltinTool, SkillShellTool};
@@ -823,6 +825,49 @@ pub fn all_tools_with_runtime(
             });
         if let Some(alias) = tg_topic_alias {
             tool_arcs.push(Arc::new(TelegramTopicTool::new(
+                Arc::new(root_config.clone()),
+                alias,
+            )));
+        }
+    }
+
+    // Telegram multiple-choice tool — registered when the calling agent
+    // listens on a Telegram channel whose topics feature is enabled and has a
+    // master group configured. Bound to that single alias; the group is fixed
+    // by config so the model can never target an arbitrary chat. Unlike
+    // `telegram_topic`, this does not additionally require `agent_managed`:
+    // rendering a multiple-choice prompt does not create/rename/close topics,
+    // it only reuses the same configured master group as the send target.
+    {
+        let tg_choice_alias = root_config
+            .agents
+            .get(agent_alias)
+            .into_iter()
+            .flat_map(|a| a.channels.iter())
+            .filter_map(|c| {
+                let s = c.as_str();
+                if s == "telegram" {
+                    Some("default".to_string())
+                } else {
+                    s.strip_prefix("telegram.").map(str::to_string)
+                }
+            })
+            .find(|alias| {
+                root_config
+                    .channels
+                    .telegram
+                    .get(alias)
+                    .is_some_and(|t| {
+                        t.enabled
+                            && t.topics.enabled
+                            && t.topics
+                                .group_id
+                                .as_deref()
+                                .is_some_and(|g| !g.trim().is_empty())
+                    })
+            });
+        if let Some(alias) = tg_choice_alias {
+            tool_arcs.push(Arc::new(TelegramMcChoiceTool::new(
                 Arc::new(root_config.clone()),
                 alias,
             )));

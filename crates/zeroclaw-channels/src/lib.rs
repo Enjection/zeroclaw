@@ -77,6 +77,8 @@ pub mod slack;
 pub mod telegram;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram_topics;
+
+pub mod memorizer_bridge;
 #[cfg(feature = "channel-twitch")]
 pub mod twitch;
 #[cfg(feature = "channel-twitter")]

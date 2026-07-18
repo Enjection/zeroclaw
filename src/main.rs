@@ -3778,6 +3778,23 @@ async fn main() -> Result<()> {
                 })
             },
         ));
+
+        // Wire multiple-choice operations to the channels orchestrator,
+        // mirroring the forum-topic bridge above. The agent-callable
+        // `telegram_mc_choice` tool calls
+        // `zeroclaw_runtime::choices::perform_choice_op`, which dispatches
+        // through this handler to the live Telegram channel.
+        // `register_choice_op_fn` is idempotent (backed by `OnceLock::set`).
+        zeroclaw_runtime::choices::register_choice_op_fn(Box::new(
+            |config, alias, chat_id, op| {
+                Box::pin(async move {
+                    zeroclaw_channels::orchestrator::perform_choice_op(
+                        &config, &alias, &chat_id, op,
+                    )
+                    .await
+                })
+            },
+        ));
     }
 
     #[cfg(feature = "agent-runtime")]

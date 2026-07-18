@@ -11034,6 +11034,61 @@ pub async fn perform_topic_op(
     anyhow::bail!("Telegram channel requires the `channel-telegram` feature")
 }
 
+/// Perform a multiple-choice operation against the live Telegram channel for
+/// `alias`, resolved from [`CRON_CHANNEL_REGISTRY`].
+///
+/// Mirrors [`perform_topic_op`]: the binary registers a closure
+/// (`zeroclaw_runtime::choices::register_choice_op_fn`) that calls this. The
+/// op runs against the *live* listening channel instance so the render +
+/// button-tap wait happens on the connection actually polling Telegram.
+/// Returns a clear error when the channel is not currently live.
+#[cfg(feature = "channel-telegram")]
+pub async fn perform_choice_op(
+    _config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    chat_id: &str,
+    op: zeroclaw_runtime::choices::ChoiceOp,
+) -> anyhow::Result<zeroclaw_runtime::choices::ChoiceOutcome> {
+    // Snapshot the Arc out of the sync RwLock before awaiting.
+    let snapshot = CRON_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let channel = snapshot.as_ref().and_then(|reg| {
+        reg.get(&format!("telegram.{alias}"))
+            .or_else(|| reg.get("telegram"))
+            .cloned()
+    });
+    let Some(channel) = channel else {
+        anyhow::bail!(
+            "Telegram channel '{alias}' is not live; multiple-choice operations require the \
+             channel runtime to be running"
+        );
+    };
+    let tg = channel
+        .as_any()
+        .and_then(|any| any.downcast_ref::<TelegramChannel>())
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "channel '{alias}' is not a Telegram channel; cannot perform multiple-choice operations"
+            ))
+        })?;
+    let zeroclaw_runtime::choices::ChoiceOp::RenderChoice { prompt, options } = op;
+    tg.render_choice(chat_id, None, &prompt, &options).await
+}
+
+/// Feature-absent stub: keeps the binary's registration closure compiling on
+/// builds without the Telegram channel.
+#[cfg(not(feature = "channel-telegram"))]
+pub async fn perform_choice_op(
+    _config: &zeroclaw_config::schema::Config,
+    _alias: &str,
+    _chat_id: &str,
+    _op: zeroclaw_runtime::choices::ChoiceOp,
+) -> anyhow::Result<zeroclaw_runtime::choices::ChoiceOutcome> {
+    anyhow::bail!("Telegram channel requires the `channel-telegram` feature")
+}
+
 pub async fn deliver_announcement(
     config: &zeroclaw_config::schema::Config,
     channel: &str,

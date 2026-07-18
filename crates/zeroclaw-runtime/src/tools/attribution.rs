@@ -29,6 +29,7 @@ use crate::tools::sop_execute::SopExecuteTool;
 use crate::tools::sop_list::SopListTool;
 use crate::tools::sop_status::SopStatusTool;
 use crate::tools::spawn_subagent::SpawnSubagentTool;
+use crate::tools::telegram_mc_choice::TelegramMcChoiceTool;
 use crate::tools::telegram_topic::TelegramTopicTool;
 use crate::tools::verifiable_intent::VerifiableIntentTool;
 
@@ -58,6 +59,7 @@ tool_attribution!(SopExecuteTool, ToolKind::SopExecute);
 tool_attribution!(SopListTool, ToolKind::SopList);
 tool_attribution!(SopStatusTool, ToolKind::SopStatus);
 tool_attribution!(SpawnSubagentTool, ToolKind::SpawnSubagent);
+tool_attribution!(TelegramMcChoiceTool, ToolKind::Plugin);
 tool_attribution!(TelegramTopicTool, ToolKind::Plugin);
 tool_attribution!(VerifiableIntentTool, ToolKind::Plugin);
 

@@ -603,6 +603,11 @@ pub struct TelegramChannel {
             >,
         >,
     >,
+    /// Pending multiple-choice prompts: `short_qid` (the choice id embedded in
+    /// each button's `memq:` callback_data) → oneshot sender for the tapped
+    /// option's index. `listen()` resolves these when a matching
+    /// `callback_query` arrives. See [`TelegramChannel::render_choice`].
+    pending_choices: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<usize>>>>,
     /// Seconds to wait for the operator to tap an inline-keyboard button on a
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
@@ -690,6 +695,7 @@ impl TelegramChannel {
             proxy_url: None,
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_choices: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
             topic_registry: Arc::new(RwLock::new(TopicRegistry::default())),
         }
@@ -1657,6 +1663,94 @@ impl TelegramChannel {
                     "No topic named \"{name}\" is tracked in this group; create it first."
                 ))
             })
+    }
+
+    /// Render a multiple-choice prompt as inline buttons and wait (bounded)
+    /// for the user's tap.
+    ///
+    /// Called from `orchestrator::perform_choice_op` after it resolves this
+    /// instance from the cron channel registry. Mirrors `request_approval`'s
+    /// oneshot pattern: the sender is registered in `pending_choices` BEFORE
+    /// the message is sent, so there is no race where the user taps a button
+    /// before the sender is in the map. The tap is resolved by `listen()`'s
+    /// `callback_query` handler via `memorizer_bridge::parse_memq_callback`,
+    /// reusing the memorizer bridge's inline-keyboard rendering so a single
+    /// `memq:` callback-data format serves both features.
+    pub(crate) async fn render_choice(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        prompt: &str,
+        options: &[String],
+    ) -> anyhow::Result<zeroclaw_runtime::choices::ChoiceOutcome> {
+        use zeroclaw_runtime::choices::ChoiceOutcome;
+
+        let choice_id = uuid::Uuid::new_v4().to_string();
+        let question = crate::memorizer_bridge::PendingQuestion {
+            short_qid: choice_id.clone(),
+            deck_id: String::new(),
+            qtype: "mc".to_string(),
+            front: prompt.to_string(),
+            options: options.to_vec(),
+        };
+        let body = crate::memorizer_bridge::build_mc_send_body(chat_id, thread_id, &question)?;
+
+        // Register the oneshot BEFORE sending the message to avoid a race
+        // where the user taps a button before the sender is in the map.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_choices
+            .lock()
+            .await
+            .insert(choice_id.clone(), tx);
+
+        let resp = self
+            .http_client()
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                let status = r.status();
+                let err = r.text().await.unwrap_or_default();
+                self.pending_choices.lock().await.remove(&choice_id);
+                anyhow::bail!("Telegram sendMessage (mc_choice) failed ({status}): {err}");
+            }
+            Err(e) => {
+                self.pending_choices.lock().await.remove(&choice_id);
+                return Err(e.into());
+            }
+        }
+
+        // Wait for the user to tap a button. Reuses the approval timeout
+        // configuration, floored at 120s since a multiple-choice prompt may
+        // need more attention than a quick approve/deny tap.
+        let timeout_secs = self.approval_timeout_secs.max(120);
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(index)) => {
+                let chosen_text = options.get(index).cloned();
+                let message = match &chosen_text {
+                    Some(text) => format!("User chose: {text}"),
+                    None => format!("User chose option index {index} (out of range)."),
+                };
+                Ok(ChoiceOutcome {
+                    chosen_index: Some(index),
+                    chosen_text,
+                    message,
+                })
+            }
+            _ => {
+                // Timeout or sender dropped — clean up.
+                self.pending_choices.lock().await.remove(&choice_id);
+                Ok(ChoiceOutcome {
+                    chosen_index: None,
+                    chosen_text: None,
+                    message: "No choice was made (timed out).".to_string(),
+                })
+            }
+        }
     }
 
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
@@ -4803,6 +4897,87 @@ Ensure only one `zeroclaw` process is using this bot token."
                                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                                         .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                                         "editMessageText (approval status) failed"
+                                    );
+                                }
+                            }
+                        }
+
+                        // ── Handle memorizer/mc_choice inline-button taps ──
+                        // Distinct `memq:` prefix, so this never fires on an
+                        // `approval:` callback and vice versa.
+                        if let Some(tap) = crate::memorizer_bridge::parse_memq_callback(cb_data) {
+                            if let Some(sender) =
+                                self.pending_choices.lock().await.remove(&tap.short_qid)
+                            {
+                                let _ = sender.send(tap.choice_idx);
+                            }
+
+                            // Answer the callback query to dismiss the spinner.
+                            let answer_body = serde_json::json!({
+                                "callback_query_id": cb_id,
+                                "text": "✓ recorded",
+                            });
+                            if let Err(e) = self
+                                .http_client()
+                                .post(self.api_url("answerCallbackQuery"))
+                                .json(&answer_body)
+                                .send()
+                                .await
+                            {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                                    "answerCallbackQuery (mc_choice) failed"
+                                );
+                            }
+
+                            // Update the message in place: drop the inline
+                            // keyboard so the buttons don't linger after a tap
+                            // is recorded.
+                            if let Some(message) = cb.get("message")
+                                && let Some(msg_chat_id) = message
+                                    .get("chat")
+                                    .and_then(|c| c.get("id"))
+                                    .and_then(serde_json::Value::as_i64)
+                                && let Some(message_id) =
+                                    message.get("message_id").and_then(serde_json::Value::as_i64)
+                            {
+                                let original = message
+                                    .get("text")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default();
+                                let edited_text = if original.is_empty() {
+                                    "✓ recorded".to_string()
+                                } else {
+                                    format!("{original}\n\n✓ recorded")
+                                };
+                                let edit_body = serde_json::json!({
+                                    "chat_id": msg_chat_id,
+                                    "message_id": message_id,
+                                    "text": edited_text,
+                                    "reply_markup": { "inline_keyboard": [] },
+                                });
+                                if let Err(e) = self
+                                    .http_client()
+                                    .post(self.api_url("editMessageText"))
+                                    .json(&edit_body)
+                                    .send()
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                                        "editMessageText (mc_choice) failed"
                                     );
                                 }
                             }
@@ -8841,6 +9016,121 @@ mod tests {
 
         let result = rx.await.unwrap();
         assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    // ── Multiple-choice inline keyboard tests ─────────────────
+
+    #[test]
+    fn pending_choices_map_is_initially_empty() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let map = ch.pending_choices.lock().await;
+            assert!(map.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn pending_choice_oneshot_delivers_index() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        let choice_id = "test-choice-123".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        ch.pending_choices
+            .lock()
+            .await
+            .insert(choice_id.clone(), tx);
+
+        // Simulate what listen() does when a memq: callback_query arrives.
+        if let Some(sender) = ch.pending_choices.lock().await.remove(&choice_id) {
+            sender.send(1).unwrap();
+        }
+
+        let result = rx.await.unwrap();
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn memq_and_approval_callback_prefixes_do_not_collide() {
+        // request_approval's callbacks use "approval:"; render_choice reuses
+        // memorizer_bridge's "memq:" prefix. listen() must be able to try
+        // both without either stealing the other's taps.
+        assert!(crate::memorizer_bridge::parse_memq_callback("approval:abc:approve").is_none());
+        assert!("memq:q1:0".strip_prefix("approval:").is_none());
+        let tap = crate::memorizer_bridge::parse_memq_callback("memq:choice-1:2").unwrap();
+        assert_eq!(tap.short_qid, "choice-1");
+        assert_eq!(tap.choice_idx, 2);
+    }
+
+    #[tokio::test]
+    async fn render_choice_sends_message_and_resolves_on_tap() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": { "message_id": 1 } })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                mention_only,
+            )
+            .with_api_base(mock_server.uri()),
+        );
+
+        let options = vec!["A".to_string(), "B".to_string()];
+        let ch_clone = Arc::clone(&ch);
+        let opts_clone = options.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            ch_clone
+                .render_choice("-100200300", None, "Pick one", &opts_clone)
+                .await
+        });
+
+        // Wait for the sender to be registered, then simulate the tap the way
+        // listen() would after parsing a `memq:` callback_query.
+        let choice_id = loop {
+            let map = ch.pending_choices.lock().await;
+            if let Some(id) = map.keys().next() {
+                break id.clone();
+            }
+            drop(map);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        if let Some(sender) = ch.pending_choices.lock().await.remove(&choice_id) {
+            sender.send(1).unwrap();
+        }
+
+        let outcome = handle.await.unwrap().unwrap();
+        assert_eq!(outcome.chosen_index, Some(1));
+        assert_eq!(outcome.chosen_text.as_deref(), Some("B"));
+        assert!(outcome.message.contains('B'));
     }
 
     #[test]
