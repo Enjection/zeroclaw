@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ChoiceOp"],"fn":["perform_choice_op","register_choice_op_fn"],"struct":["ChoiceOutcome"],"type":["ChoiceOpFn"]};

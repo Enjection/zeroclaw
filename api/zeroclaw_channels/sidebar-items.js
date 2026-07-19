@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["acp_channel","allowlist","cli","discord","discord_slash_state","email_channel","filesystem","gmail_push","link_enricher","listing","memorizer_bridge","orchestrator","paced_channel","telegram","telegram_topics","transcription","tts","util","voice","webhook"]};

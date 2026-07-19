@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["NodeType","Relation"],"struct":["PgEdge","PgKnowledgeGraph","PgNode"]};

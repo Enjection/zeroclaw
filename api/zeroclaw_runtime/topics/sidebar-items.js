@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["TopicOp"],"fn":["perform_topic_op","register_topic_op_fn"],"struct":["TopicOpOutcome"],"type":["TopicOpFn"]};
