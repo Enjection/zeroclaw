@@ -73,6 +73,44 @@ fn letter_for(idx: usize) -> char {
     (b'A' + (idx as u8 % 26)) as char
 }
 
+/// Normalize LaTeX math delimiters to the `$…$` / `$$…$$` form that Telegram's
+/// rich renderer typesets. Models often emit `\(x\)` / `\[x\]` instead, which
+/// otherwise show as literal backslashes. Always safe to run on outgoing text.
+pub fn normalize_latex_delimiters(s: &str) -> String {
+    s.replace("\\[", "$$")
+        .replace("\\]", "$$")
+        .replace("\\(", "$")
+        .replace("\\)", "$")
+}
+
+/// If `text` carries LaTeX math, return it with delimiters normalized to
+/// `$…$`/`$$…$$` (so a caller can render it via `sendRichMessage`); otherwise
+/// `None` (no math — keep the plain text path).
+pub fn latex_to_rich_markdown(text: &str) -> Option<String> {
+    let has_math = text.contains("\\(")
+        || text.contains("\\[")
+        || text.contains("$$")
+        || contains_inline_math(text);
+    has_math.then(|| normalize_latex_delimiters(text))
+}
+
+/// True when `text` has a `$…$` span whose content looks like LaTeX (a backslash
+/// command, super/subscript, or braces). This keeps currency like `$5` — or two
+/// prices `$5 … $10` — from being mistaken for math.
+fn contains_inline_math(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(open) = rest.find('$') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('$') else { break };
+        let inner = &after[..close];
+        if inner.chars().any(|c| matches!(c, '\\' | '^' | '_' | '{' | '}')) {
+            return true;
+        }
+        rest = &after[close + 1..];
+    }
+    false
+}
+
 /// Build a `sendRichMessage` body for a multiple-choice question. The front is
 /// rendered as markdown so the agent's **bold** framing and any `$…$` LaTeX both
 /// typeset (used for ALL MC questions — plain `sendMessage` shows markdown
@@ -133,7 +171,7 @@ pub fn build_rich_mc_send_body_ordered(
     q: &PendingQuestion,
     order: &[usize],
 ) -> anyhow::Result<Value> {
-    let mut md = q.front.clone();
+    let mut md = normalize_latex_delimiters(&q.front);
     let mut buttons: Vec<Value> = Vec::with_capacity(order.len());
     for (display_pos, &orig) in order.iter().enumerate() {
         let opt = &q.options[orig];
@@ -145,7 +183,7 @@ pub fn build_rich_mc_send_body_ordered(
             );
         }
         let letter = letter_for(display_pos);
-        md.push_str(&format!("\n\n{}) {}", letter, opt));
+        md.push_str(&format!("\n\n{}) {}", letter, normalize_latex_delimiters(opt)));
         buttons.push(json!({ "text": letter.to_string(), "callback_data": data }));
     }
     // One horizontal row of letter buttons (inline_keyboard = rows of buttons).
@@ -353,6 +391,41 @@ mod tests {
     fn mc_display_order_keeps_referential_options_in_place() {
         let opts = vec!["a".into(), "b".into(), "all of the above".into()];
         assert_eq!(mc_display_order(&opts), vec![0, 1, 2]); // never shuffled
+    }
+
+    #[test]
+    fn normalize_latex_delimiters_converts_paren_and_bracket_forms() {
+        assert_eq!(normalize_latex_delimiters("\\(q_*\\)"), "$q_*$");
+        assert_eq!(normalize_latex_delimiters("\\[ x=1 \\]"), "$$ x=1 $$");
+        assert_eq!(normalize_latex_delimiters("a \\(b\\) and \\[c\\]"), "a $b$ and $$c$$");
+        assert_eq!(normalize_latex_delimiters("$x^2$ stays"), "$x^2$ stays");
+    }
+
+    #[test]
+    fn latex_to_rich_markdown_detects_math_only() {
+        assert_eq!(latex_to_rich_markdown("\\(q_*\\)").as_deref(), Some("$q_*$"));
+        assert_eq!(latex_to_rich_markdown("block \\[y\\]").as_deref(), Some("block $$y$$"));
+        assert_eq!(latex_to_rich_markdown("$x^2$ inline").as_deref(), Some("$x^2$ inline")); // ^ → math
+        assert_eq!(latex_to_rich_markdown("$\\pi$").as_deref(), Some("$\\pi$")); // \ command → math
+        assert!(latex_to_rich_markdown("just prose").is_none());
+        assert!(latex_to_rich_markdown("pay $5 today").is_none()); // lone $ = currency
+        assert!(latex_to_rich_markdown("costs $5 and $10").is_none()); // two prices, not math
+    }
+
+    #[test]
+    fn mc_body_normalizes_latex_in_front_and_options() {
+        let q = PendingQuestion {
+            short_qid: "q1".into(),
+            deck_id: String::new(),
+            qtype: "mc".into(),
+            front: "What is \\(q_*\\)?".into(),
+            options: vec!["\\(a\\)".into(), "b".into()],
+        };
+        let body = build_rich_mc_send_body_ordered("-1", None, &q, &[0, 1]).unwrap();
+        let md = body["rich_message"]["markdown"].as_str().unwrap();
+        assert!(md.contains("$q_*$"), "front math normalized: {md}");
+        assert!(md.contains("A) $a$"), "option math normalized: {md}");
+        assert!(!md.contains("\\("), "no raw backslash-paren left: {md}");
     }
 
     #[test]

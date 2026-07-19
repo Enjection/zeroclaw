@@ -3479,6 +3479,36 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .replace('\'', "&#39;")
     }
 
+    /// Send one plain (no-keyboard) rich-markdown message. Used for text that
+    /// carries LaTeX, which classic `sendMessage` cannot typeset. Errors on a
+    /// non-2xx response so the caller can fall back to `sendMessage`.
+    async fn send_rich_markdown(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        markdown: &str,
+    ) -> anyhow::Result<()> {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "rich_message": { "markdown": markdown },
+        });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+        let resp = self
+            .http_client()
+            .post(self.api_url("sendRichMessage"))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram sendRichMessage failed ({status}): {err}");
+        }
+        Ok(())
+    }
+
     async fn send_text_chunks(
         &self,
         message: &str,
@@ -3489,6 +3519,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         for (index, chunk) in chunks.iter().enumerate() {
             let text = format_telegram_text_chunk(chunk, index, chunks.len());
+
+            // LaTeX math only typesets via sendRichMessage (classic sendMessage
+            // parse_mode can't render it). Route math chunks there, normalizing
+            // \(\)/\[\] → $/$$; on failure fall through to the plain path.
+            if let Some(md) = crate::memorizer_bridge::latex_to_rich_markdown(&text) {
+                match self.send_rich_markdown(chat_id, thread_id, &md).await {
+                    Ok(()) => {
+                        if index < chunks.len() - 1 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                            "sendRichMessage failed for math text; falling back to plain sendMessage"
+                        );
+                    }
+                }
+            }
 
             let markdown_body = telegram_topics::build_telegram_send_body(
                 chat_id,
