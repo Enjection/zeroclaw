@@ -121,19 +121,20 @@ pub fn build_rich_mc_send_body(
 }
 
 /// Build the sendRichMessage body presenting `q.options` in `order` (a
-/// permutation of the option indices). Button letters/positions follow the
-/// display order, but each button's `callback_data` encodes the option's
-/// ORIGINAL index — so whichever option the user taps grades against the stored
-/// answer regardless of how it was shuffled on screen.
+/// permutation of the option indices). Options are ALWAYS listed full-text in
+/// the message body (A) …, B) …) — button labels truncate long text and can't
+/// render LaTeX — and the keyboard is a single horizontal row of short letter
+/// buttons [A][B][C][D]. Letters/positions follow the display order, but each
+/// button's `callback_data` encodes the option's ORIGINAL index, so whichever
+/// option the user taps grades against the stored answer regardless of shuffle.
 pub fn build_rich_mc_send_body_ordered(
     chat_id: &str,
     thread_id: Option<&str>,
     q: &PendingQuestion,
     order: &[usize],
 ) -> anyhow::Result<Value> {
-    let options_have_math = q.options.iter().any(|o| o.contains('$'));
     let mut md = q.front.clone();
-    let mut rows: Vec<Value> = Vec::with_capacity(order.len());
+    let mut buttons: Vec<Value> = Vec::with_capacity(order.len());
     for (display_pos, &orig) in order.iter().enumerate() {
         let opt = &q.options[orig];
         let data = memq_callback_data(&q.short_qid, orig);
@@ -143,22 +144,15 @@ pub fn build_rich_mc_send_body_ordered(
                 data.len(),
             );
         }
-        // Button labels can't render LaTeX: when an option carries math, list the
-        // options in the body (A) …) with A/B/C buttons; otherwise put the option
-        // text directly on the button (nicer to tap). Letters follow the on-screen
-        // order; the callback still points at the original option.
-        if options_have_math {
-            let letter = letter_for(display_pos);
-            md.push_str(&format!("\n\n{}) {}", letter, opt));
-            rows.push(json!([{ "text": letter.to_string(), "callback_data": data }]));
-        } else {
-            rows.push(json!([{ "text": opt, "callback_data": data }]));
-        }
+        let letter = letter_for(display_pos);
+        md.push_str(&format!("\n\n{}) {}", letter, opt));
+        buttons.push(json!({ "text": letter.to_string(), "callback_data": data }));
     }
+    // One horizontal row of letter buttons (inline_keyboard = rows of buttons).
     let mut body = json!({
         "chat_id": chat_id,
         "rich_message": { "markdown": md },
-        "reply_markup": { "inline_keyboard": rows },
+        "reply_markup": { "inline_keyboard": [buttons] },
     });
     if let Some(tid) = thread_id {
         body["message_thread_id"] = Value::String(tid.to_string());
@@ -286,17 +280,21 @@ mod tests {
     }
 
     #[test]
-    fn mc_plain_options_put_text_on_buttons() {
-        // No math → option text on the buttons (nicer to tap); front is markdown.
-        // Identity order to assert the exact mapping deterministically.
+    fn mc_options_render_in_body_with_letter_buttons() {
+        // Options are listed full-text in the body (long text truncates on
+        // buttons); the keyboard is one horizontal row of short letter buttons.
         let body = build_rich_mc_send_body_ordered("-100200300", Some("42"), &sample(), &[0, 1, 2]).unwrap();
-        assert!(body["rich_message"]["markdown"].as_str().unwrap().contains("2+2?"));
+        let md = body["rich_message"]["markdown"].as_str().unwrap();
+        assert!(md.contains("2+2?"));
+        assert!(md.contains("A) 3"), "{md}");
+        assert!(md.contains("C) 5"), "{md}");
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
-        assert_eq!(kb.len(), 3);
+        assert_eq!(kb.len(), 1); // single horizontal row
+        assert_eq!(kb[0].as_array().unwrap().len(), 3); // three letter buttons in it
         assert_eq!(body["message_thread_id"], Value::String("42".into()));
-        assert_eq!(kb[0][0]["text"], "3"); // option text, not a letter
+        assert_eq!(kb[0][0]["text"], "A"); // short letter, not the option text
         assert_eq!(kb[0][0]["callback_data"], "memq:q1:0");
-        assert_eq!(kb[2][0]["callback_data"], "memq:q1:2");
+        assert_eq!(kb[0][2]["callback_data"], "memq:q1:2");
     }
 
     fn math_sample() -> PendingQuestion {
@@ -311,22 +309,23 @@ mod tests {
 
     #[test]
     fn rich_math_options_use_lettered_buttons_and_body() {
-        // Options carry math → A/B/C buttons, option text in the body.
+        // Math options: A/B/C letter buttons (one row), option text in the body.
         let body = build_rich_mc_send_body("-100200300", Some("42"), &math_sample()).unwrap();
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
-        assert_eq!(kb.len(), 3);
+        assert_eq!(kb.len(), 1);
+        assert_eq!(kb[0].as_array().unwrap().len(), 3);
         assert_eq!(body["message_thread_id"], Value::String("42".into()));
         assert_eq!(kb[0][0]["text"], "A");
-        assert_eq!(kb[2][0]["text"], "C");
+        assert_eq!(kb[0][2]["text"], "C");
     }
 
     #[test]
     fn rich_letters_map_to_callback_index() {
-        // Identity order: letter A/C line up with option index 0/2.
+        // Identity order: letter A/C line up with option index 0/2 (same row).
         let body = build_rich_mc_send_body_ordered("-1", None, &math_sample(), &[0, 1, 2]).unwrap();
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb[0][0]["callback_data"], "memq:q1:0");
-        assert_eq!(kb[2][0]["callback_data"], "memq:q1:2");
+        assert_eq!(kb[0][2]["callback_data"], "memq:q1:2");
         let md = body["rich_message"]["markdown"].as_str().unwrap();
         assert!(md.contains("A) $\\tfrac12$"), "{md}");
         assert!(md.contains("C) $2$"), "{md}");
@@ -358,19 +357,21 @@ mod tests {
 
     #[test]
     fn shuffled_body_preserves_original_index_mapping() {
-        // Whatever the on-screen order, each button's callback must resolve to the
-        // option it displays — so grading (by index or text) stays correct.
+        // Whatever the on-screen order, the letter button at each display slot must
+        // carry the ORIGINAL index of the option shown at that slot in the body —
+        // so grading (by index or text) stays correct.
         let q = sample(); // options ["3","4","5"]
         let order = [2usize, 0, 1];
         let body = build_rich_mc_send_body_ordered("-1", None, &q, &order).unwrap();
         let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
+        let md = body["rich_message"]["markdown"].as_str().unwrap();
         for (display_pos, &orig) in order.iter().enumerate() {
-            let btn = &kb[display_pos][0];
-            assert_eq!(btn["text"], q.options[orig]); // shows the original option text
-            assert_eq!(
-                btn["callback_data"],
-                format!("memq:q1:{orig}") // callback carries the ORIGINAL index
-            );
+            let letter = (b'A' + display_pos as u8) as char;
+            let btn = &kb[0][display_pos]; // one row → index by display position
+            assert_eq!(btn["text"], letter.to_string());
+            assert_eq!(btn["callback_data"], format!("memq:q1:{orig}")); // ORIGINAL index
+            // …and the body lists that same option under the same letter.
+            assert!(md.contains(&format!("{letter}) {}", q.options[orig])), "{md}");
         }
     }
 
